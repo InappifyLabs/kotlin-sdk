@@ -1,4 +1,4 @@
 jdk:
   - openjdk17
 install:
-  - ./gradlew --no-daemon clean :sdk:testDebugUnitTest :sdk:lintRelease :sdk:assembleRelease :sdk:publishReleasePublicationToMavenLocal
+  - ./gradlew --no-daemon clean :sdk:assembleRelease :sdk:publishReleasePublicationToMavenLocal

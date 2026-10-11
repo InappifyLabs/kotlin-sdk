@@ -43,7 +43,8 @@ change receipt bindings, application identity or encrypted storage scope.
 
 ## Verify distribution
 
-JitPack builds from the Git tag using `jitpack.yml`. Resolve the real public
+JitPack builds the AAR and source archive from the Git tag using `jitpack.yml`.
+It does not rerun the automated suites; validation is handled separately by CI. Resolve the real public
 coordinate from an independent consumer with JitPack restricted to the SDK
 group and Poolakey's group. Do not use MavenLocal or dependency substitution in
 this distribution check. Build Debug and Release with R8, compare the received
