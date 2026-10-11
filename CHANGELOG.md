@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.0
+
+- Publish the first stable release from the 0.1.0 beta series.
+- Set the runtime SDK version to `0.1.0` and the Git/JitPack tag to `v0.1.0`.
+- Preserve the existing public API, payment behavior, recovery and storage formats.
+
 ## 0.1.0-beta.0
 
 Initial beta of the Inappify Kotlin SDK in this repository.

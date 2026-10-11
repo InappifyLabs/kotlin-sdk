@@ -2,13 +2,13 @@
 
 Repository: <https://github.com/InappifyLabs/kotlin-sdk>.
 
-The runtime version in `gradle.properties` is `0.1.0-beta.0`. Beta versions use
+The runtime version in `gradle.properties` is `0.1.0`. Beta versions use
 `major.minor.patch-beta.N`; stable versions use `major.minor.patch`. Git tags
-prefix this value with `v`, so this release is tagged `v0.1.0-beta.0`. JitPack
+prefix this value with `v`, so this release is tagged `v0.1.0`. JitPack
 consumers use the tag verbatim:
 
 ```kotlin
-implementation("com.github.InappifyLabs:kotlin-sdk:v0.1.0-beta.0")
+implementation("com.github.InappifyLabs:kotlin-sdk:v0.1.0")
 ```
 
 `BuildConfig.SDK_VERSION`, Configure's `sdkVersion`, SDK user-agent and snapshots
@@ -37,8 +37,9 @@ change receipt bindings, application identity or encrypted storage scope.
    required; compilation alone does not establish store or backend behavior.
 4. Commit the reviewed tree, create an annotated tag and push the branch/tag
    normally. Never move a published tag to different source.
-5. Check GitHub Actions for the exact commit and tag. Publish the GitHub beta
-   release as a **prerelease**, attaching only the SDK AAR and sources archive.
+5. Check GitHub Actions for the exact commit and tag. Publish the GitHub stable
+   release with **prerelease disabled**, attaching only the SDK AAR and sources archive.
+   Reserve prerelease status for versions with a beta suffix.
 
 ## Verify distribution
 

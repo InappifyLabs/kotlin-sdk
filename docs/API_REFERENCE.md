@@ -1,7 +1,7 @@
 # Kotlin API reference
 
-Artifact: `com.github.InappifyLabs:kotlin-sdk:v0.1.0-beta.0`.
-SDK-reported version: `0.1.0-beta.0`, including the beta suffix and without the
+Artifact: `com.github.InappifyLabs:kotlin-sdk:v0.1.0`.
+SDK-reported version: `0.1.0`, without the
 Git tag prefix. Configure, snapshots and targeting use that exact value; local
 version normalization does not alter production server offering selection. Public types and extension functions live in
 `com.inappify.sdk`; import individual symbols or `com.inappify.sdk.*`.

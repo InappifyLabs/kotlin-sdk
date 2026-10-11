@@ -4,11 +4,11 @@ Native Android purchases, customer entitlements, offerings, targeting and durabl
 purchase recovery for Inappify. The SDK supports Cafe Bazaar, Myket and Direct
 checkout through a verified V2 session.
 
-**Release:** `0.1.0-beta.0` · **Git tag:** `v0.1.0-beta.0`
+**Release:** `0.1.0` · **Git tag:** `v0.1.0`
 
-Configure, snapshots and SDK targeting report exactly `0.1.0-beta.0`, including
-the beta suffix and without the Git tag’s `v` prefix. No local version
-normalization changes the server’s offering selection.
+Configure, snapshots and SDK targeting report exactly `0.1.0`, without the Git
+tag’s `v` prefix. No local version normalization changes the server’s offering
+selection.
 
 The Kotlin package is `com.inappify.sdk`. This is an Android library; it does not
 provide iOS, Flutter, Google Play Billing or a JavaScript client.
@@ -53,7 +53,7 @@ android {
 }
 
 dependencies {
-    implementation("com.github.InappifyLabs:kotlin-sdk:v0.1.0-beta.0")
+    implementation("com.github.InappifyLabs:kotlin-sdk:v0.1.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
 }
 ```
@@ -133,7 +133,7 @@ with ownership/linkage validation. You can disable that workflow through
 `InappifyOptions.enableSubscriptionRecoveryWithoutPayload` without deleting its
 pending checkpoints.
 
-This beta requires testing against your registered, signed app, real store
+This release requires testing against your registered, signed app, real store
 accounts and configured Inappify backend. Build and synthetic test success do
 not establish real purchase or renewal acceptance.
 
