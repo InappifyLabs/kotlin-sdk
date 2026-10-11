@@ -2,7 +2,7 @@
 # Keep this set aligned with Gradle 8.7, Kotlin 1.9, compileSdk 34 and minSdk 21.
 # Major toolchain / AndroidX upgrades need a separate compatibility migration.
 agp = "8.5.1"
-kotlin = "1.9.0"
+kotlin = "2.4.20"
 coreKtx = "1.10.1"
 junit = "4.13.2"
 junitVersion = "1.1.5"
