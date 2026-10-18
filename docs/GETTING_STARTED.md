@@ -1,6 +1,6 @@
 # Getting started
 
-This guide uses `com.github.InappifyLabs:kotlin-sdk:v0.1.0` and the public
+This guide uses `com.github.InappifyLabs:kotlin-sdk:v0.1.1` and the public
 Kotlin package `com.inappify.sdk`. Follow [installation](../README.md#install)
 first. All SDK operations below are suspend functions unless stated otherwise.
 
@@ -120,19 +120,18 @@ import com.inappify.sdk.*
 
 suspend fun selectCustomer(
     client: InappifyV2Client,
-    appPublicKey: String,
     customerId: String,
 ): InappifyResult<Unit> = client.login(
     InappifyLoginRequest(
-        apiKey = appPublicKey,
         appUserIdentifier = customerId,
     ),
 )
 ```
 
-The required request `apiKey` is the same configured app public key. Login HTTP
-uses the current session Bearer. Await login before querying or purchasing for
-the new customer. `logout()` returns to an anonymous session. Uncertain identity
+Login requires only the customer identifier and uses the current session Bearer.
+The app public key remains in Configure for session bootstrap and renewal. Await
+login before querying or purchasing for the new customer. `logout()` returns to
+an anonymous session. Uncertain identity
 transitions remain durable; call `recover()` to reconcile them. While logout is
 pending, `isLogoutPending` exposes the barrier and predecessor customer data is
 hidden. `close()` releases resources and does not log out or delete paid work.
@@ -164,7 +163,7 @@ suspend fun offeringForPaywall(
 
 Fresh offerings requests flush the durable attribute queue first. The server
 performs targeting using the current session, queued attributes, country,
-appVersion and SDK version `0.1.0`. Configure/snapshots use this exact
+appVersion and SDK version `0.1.1`. Configure/snapshots use this exact
 version without the tag prefix; the client does not
 normalize it locally for selection. SDK version is separate from your app
 version. Current selection uses a matching placement offering, then the server's

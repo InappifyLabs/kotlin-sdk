@@ -210,7 +210,7 @@ class GoSubjectBindingTest {
             sdk.refreshOfferings(); sdk.queueAttributes(mapOf("campaign" to "previous-owner"))
             internalId = "91002"
             val target = "customer_new_identity_123"
-            assertTrue(sdk.login(InappifyLoginRequest(options.apiKey, target)) is InappifyResult.Success)
+            assertTrue(sdk.login(InappifyLoginRequest(target)) is InappifyResult.Success)
             assertEquals(target, sdk.snapshot.appUserIdentifier)
             assertTrue(sdk.snapshot.isAuthenticated)
             assertEquals(internalId, saved().string("customerSubject"))
@@ -228,7 +228,7 @@ class GoSubjectBindingTest {
         client().use { sdk ->
             configure(sdk)
             transport.handler = { transport.response(envelope(identity = "wrong_public_identity_123", subject = "91002")) }
-            val failure = error(sdk.login(InappifyLoginRequest(options.apiKey, "requested_public_identity_123")))
+            val failure = error(sdk.login(InappifyLoginRequest("requested_public_identity_123")))
             assertEquals("appUserId", failure.details["mismatchField"])
             assertEquals("login", failure.details["operation"])
             assertEquals(200, failure.details["httpStatus"])
@@ -248,7 +248,7 @@ class GoSubjectBindingTest {
             sdk.refreshOfferings(); sdk.queueAttributes(mapOf("campaign" to "previous-owner"))
             val alias = publicId
             internalId = "91002"
-            assertTrue(sdk.login(InappifyLoginRequest(options.apiKey, alias)) is InappifyResult.Success)
+            assertTrue(sdk.login(InappifyLoginRequest(alias)) is InappifyResult.Success)
             assertEquals(alias, sdk.snapshot.appUserIdentifier)
             assertEquals(internalId, saved().string("customerSubject"))
             assertNull(sdk.snapshot.offerings)
@@ -292,7 +292,7 @@ class GoSubjectBindingTest {
             configure(sdk)
             val before = sdk.snapshot
             store.failSave = true; internalId = "91002"
-            assertTrue(sdk.login(InappifyLoginRequest(options.apiKey, "requested_public_identity_123")) is InappifyResult.Failure)
+            assertTrue(sdk.login(InappifyLoginRequest("requested_public_identity_123")) is InappifyResult.Failure)
             assertEquals(before, sdk.snapshot)
             assertEquals("91001", saved().string("customerSubject"))
         }

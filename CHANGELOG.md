@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.1
+
+- Login requests now need only `appUserIdentifier`; the configured session
+  supplies authentication. Keep the former two-argument constructor deprecated
+  for existing callers; its app-key argument is unused.
+- Set the runtime version to `0.1.1` and the Git/JitPack tag to `v0.1.1`.
+
 ## 0.1.0
 
 - Publish the first stable release from the 0.1.0 beta series.

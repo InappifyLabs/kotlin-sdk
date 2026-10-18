@@ -1,7 +1,7 @@
 # Kotlin API reference
 
-Artifact: `com.github.InappifyLabs:kotlin-sdk:v0.1.0`.
-SDK-reported version: `0.1.0`, without the
+Artifact: `com.github.InappifyLabs:kotlin-sdk:v0.1.1`.
+SDK-reported version: `0.1.1`, without the
 Git tag prefix. Configure, snapshots and targeting use that exact value; local
 version normalization does not alter production server offering selection. Public types and extension functions live in
 `com.inappify.sdk`; import individual symbols or `com.inappify.sdk.*`.
@@ -49,7 +49,7 @@ ordinary bound store recovery. See [recovery](GETTING_STARTED.md#restore-and-aut
 | Method | Result | Production behavior |
 | --- | --- | --- |
 | `configure(options)` | `InappifyResult<Unit>` | Verify/load app-bound cache, resolve identity, reuse or establish a verified session, schedule background recovery |
-| `login(InappifyLoginRequest(apiKey, appUserIdentifier))` | `InappifyResult<Unit>` | Transition from the current session to a custom customer; HTTP uses the session Bearer |
+| `login(InappifyLoginRequest(appUserIdentifier))` | `InappifyResult<Unit>` | Transition from the current session to a custom customer; HTTP uses the session Bearer |
 | `logout()` | `InappifyResult<Unit>` | Complete the durable logout transition and create an anonymous session |
 | `isCustomerAnonymous(appUserIdentifier)` | `Boolean` | Client helper recognizes valid SDK anonymous identifiers |
 | `recover()` | `InappifyResult<Unit>` | Reconcile pending identity transition, customer state, store/delivery work and offerings |
@@ -57,8 +57,9 @@ ordinary bound store recovery. See [recovery](GETTING_STARTED.md#restore-and-aut
 
 Custom identity is 1–100 Unicode code points, with no controls, edge whitespace,
 malformed Unicode or reserved anonymous prefix. Login does not accept an anonymous
-identity as its target. Use the same configured app public key in
-`InappifyLoginRequest`; the session is authoritative. Changing the app key/service
+identity as its target. `InappifyLoginRequest` needs only the customer identifier;
+the configured session is authoritative. The former two-argument constructor is
+deprecated and ignores its app-key argument. Changing the app key/service
 binding requires a new client. `isLogoutPending` exposes the logout barrier.
 
 The `restoreCachedSession(options): InappifyResult<Boolean>` extension is exported

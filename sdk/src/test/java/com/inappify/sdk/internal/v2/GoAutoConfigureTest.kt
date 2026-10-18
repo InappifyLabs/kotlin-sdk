@@ -175,7 +175,7 @@ class GoAutoConfigureTest {
                 mutatePayload = { it.addProperty("project_id", 35) }).apply {
                     addProperty("sessionToken", "rejected-cross-project-token")
                 }) }
-            val rejected = sdk.login(InappifyLoginRequest(options.apiKey, target)) as InappifyResult.Failure
+            val rejected = sdk.login(InappifyLoginRequest(target)) as InappifyResult.Failure
             assertEquals("SIGNATURE", rejected.error.details["category"])
             assertEquals("project_id", rejected.error.details["mismatchField"])
             assertEquals("login", rejected.error.details["operation"])

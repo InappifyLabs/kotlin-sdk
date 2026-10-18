@@ -62,9 +62,11 @@ class GoV2ClientTest {
             installHandler()
             assertTrue(sdk.configure(InappifyOptions("public-key", "0")) is InappifyResult.Success)
             assertEquals("0", jsonObject(transport.requests.single().jsonBody).string("appUserIdentifier"))
-            assertTrue(sdk.login(InappifyLoginRequest("public-key", "1234")) is InappifyResult.Success)
+            assertTrue(sdk.login(InappifyLoginRequest("1234")) is InappifyResult.Success)
             val login = transport.requests.last { it.path == "login" }
             assertEquals("1234", jsonObject(login.jsonBody).string("appUserIdentifier"))
+            assertEquals(setOf("appUserIdentifier"), jsonObject(login.jsonBody).keySet())
+            assertEquals("Bearer go-session-token", login.headers["Authorization"])
             assertEquals("1234", sdk.snapshot.appUserIdentifier)
         }
     }
@@ -132,7 +134,7 @@ class GoV2ClientTest {
     @Test fun secureWriteFailureCannotPublishNewIdentity() = runBlocking {
         client().use { sdk ->
             configured(sdk); store.failSave = true
-            assertTrue(sdk.login(InappifyLoginRequest("public-key", "customer_other_123456")) is InappifyResult.Failure)
+            assertTrue(sdk.login(InappifyLoginRequest("customer_other_123456")) is InappifyResult.Failure)
             assertEquals(signing.subject, sdk.snapshot.appUserIdentifier)
         }
     }
@@ -140,7 +142,7 @@ class GoV2ClientTest {
         client().use { sdk ->
             configured(sdk)
             transport.handler = { transport.response(jsonObject("""{"status":false,"code":"CUSTOMER_MERGE_FAILED"}"""), 409) }
-            assertTrue(sdk.login(InappifyLoginRequest("public-key", "customer_other_123456")) is InappifyResult.Failure)
+            assertTrue(sdk.login(InappifyLoginRequest("customer_other_123456")) is InappifyResult.Failure)
             assertEquals(signing.subject, sdk.snapshot.appUserIdentifier); assertTrue(sdk.hasEntitlement("pro"))
             assertTrue(sdk.snapshot.isConfigured)
             assertFalse(jsonObject(store.value!!.customerInfoJson!!).has("pendingLogin"))
@@ -153,7 +155,7 @@ class GoV2ClientTest {
         client().use { sdk ->
             configured(sdk)
             transport.handler = { TransportResult.Failure(TransportFailureKind.NETWORK) }
-            assertTrue(sdk.login(InappifyLoginRequest("public-key", target)) is InappifyResult.Failure)
+            assertTrue(sdk.login(InappifyLoginRequest(target)) is InappifyResult.Failure)
             assertFalse(sdk.snapshot.isConfigured)
             assertNull(sdk.snapshot.appUserIdentifier)
             assertFalse(sdk.hasEntitlement("pro"))
@@ -187,7 +189,7 @@ class GoV2ClientTest {
                     transport.response(jsonObject("""{"status":false,"code":"LOGIN_ATTEMPT_NOT_FOUND"}"""), 401)
                 else base(req)
             }
-            assertTrue(sdk.login(InappifyLoginRequest("public-key", target)) is InappifyResult.Success)
+            assertTrue(sdk.login(InappifyLoginRequest(target)) is InappifyResult.Success)
             val requests = transport.requests
             assertEquals(listOf("configure", "login", "configure", "login"), requests.map { it.path })
             assertEquals("Bearer public-key", requests[2].headers["Authorization"])
@@ -201,7 +203,7 @@ class GoV2ClientTest {
     @Test fun loginClearsOldOfferingsAndAttributesBeforePublishingNewUser() = runBlocking {
         client().use { sdk ->
             configured(sdk); sdk.refreshOfferings(); sdk.queueAttributes(mapOf("campaign" to "old"))
-            assertTrue(sdk.login(InappifyLoginRequest("public-key", "customer_other_123456")) is InappifyResult.Success)
+            assertTrue(sdk.login(InappifyLoginRequest("customer_other_123456")) is InappifyResult.Success)
             assertNull(sdk.snapshot.offerings)
             val attributesBefore = transport.requests.count { it.path == "attributes" }
             sdk.flushAttributes()

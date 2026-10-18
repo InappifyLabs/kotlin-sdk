@@ -186,7 +186,7 @@ class TargetingSyncTest {
             val syncing = async(start = CoroutineStart.UNDISPATCHED) { f.client.syncAttributesAndOfferingsIfNeeded() }
             withTimeout(2_000) { entered.await() }
             val login = async(start = CoroutineStart.UNDISPATCHED) {
-                f.client.login(InappifyLoginRequest("fixture-key", "customer_other_123456"))
+                f.client.login(InappifyLoginRequest("customer_other_123456"))
             }
             assertFalse(f.calls.contains("login"))
             release.complete(Unit)
@@ -203,7 +203,7 @@ class TargetingSyncTest {
             f.configure()
             repeat(5) { f.client.syncAttributesAndOfferingsIfNeeded().success() }
             f.catalog = "other-account"
-            f.client.login(InappifyLoginRequest("fixture-key", "customer_other_123456")).success()
+            f.client.login(InappifyLoginRequest("customer_other_123456")).success()
             f.client.refreshOfferings().success()
             f.calls.clear()
             val result = f.client.syncAttributesAndOfferingsIfNeeded().success()

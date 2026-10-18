@@ -156,7 +156,7 @@ class GoCommerceSessionTest {
     @Test fun persistedPendingDoesNotCrossIdentityOrCommerceEndpoint() = runBlocking {
         client().use { sdk ->
             configure(sdk); sdk.syncPendingConsumables()
-            assertTrue(sdk.login(InappifyLoginRequest("public-bootstrap-key", "customer-other")) is InappifyResult.Success)
+            assertTrue(sdk.login(InappifyLoginRequest("customer-other")) is InappifyResult.Success)
             assertTrue(sdk.confirmDelivery(7) is InappifyResult.Failure)
             assertFalse(commerce.requests.any { it.path.endsWith("/delivered") })
         }
@@ -176,7 +176,7 @@ class GoCommerceSessionTest {
             expired = false; now += 2000; token = "session-refreshed"
             pending = false
             assertTrue(sdk.syncPendingConsumables() is InappifyResult.Success)
-            assertTrue(sdk.login(InappifyLoginRequest("public-bootstrap-key", "customer-second")) is InappifyResult.Success)
+            assertTrue(sdk.login(InappifyLoginRequest("customer-second")) is InappifyResult.Success)
             assertTrue(sdk.syncPendingConsumables() is InappifyResult.Success)
             assertTrue(sdk.logout() is InappifyResult.Success)
             assertTrue(sdk.syncPendingConsumables() is InappifyResult.Success)

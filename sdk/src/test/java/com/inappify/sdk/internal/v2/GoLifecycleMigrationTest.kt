@@ -116,7 +116,7 @@ class GoLifecycleMigrationTest {
             assertTrue(sdk.configure(options) is InappifyResult.Success)
             val before = sdk.snapshot
             sdk.setNetworkEnabled(false)
-            assertTrue(sdk.login(InappifyLoginRequest("public-key", "new-user")) is InappifyResult.Failure)
+            assertTrue(sdk.login(InappifyLoginRequest("new-user")) is InappifyResult.Failure)
             assertEquals(before, sdk.snapshot)
             assertTrue(sdk.logout() is InappifyResult.Failure)
             assertEquals(before, sdk.snapshot)

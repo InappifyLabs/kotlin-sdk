@@ -41,12 +41,20 @@ class PublicApiTest {
     @Test
     fun loginRequestToString_redactsSensitiveValues() {
         val rendered = InappifyLoginRequest(
-            apiKey = "public-api-key",
             appUserIdentifier = "09120000000",
         ).toString()
 
-        assertFalse(rendered.contains("public-api-key"))
         assertFalse(rendered.contains("09120000000"))
+    }
+
+    @Test
+    fun loginRequestRetainsPublishedConstructorWithoutRequiringAnAppKey() {
+        val type = InappifyLoginRequest::class.java
+        val current = type.getConstructor(String::class.java).newInstance("customer")
+        val legacy = type.getConstructor(String::class.java, String::class.java)
+            .newInstance("unused-old-key", "customer")
+        assertEquals(current.appUserIdentifier, legacy.appUserIdentifier)
+        assertFalse(legacy.toString().contains("unused-old-key"))
     }
 
     @Test
