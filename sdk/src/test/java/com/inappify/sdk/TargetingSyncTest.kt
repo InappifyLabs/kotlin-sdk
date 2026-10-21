@@ -15,7 +15,7 @@ class TargetingSyncTest {
     @Test fun uploadsAttributesBeforeFreshOfferingsAndPersistsAndPublishesTheResult() = runBlocking {
         Fixture().use { f ->
             f.configure()
-            f.client.refreshOfferings().success()
+            f.client.getOfferings().success()
             val old = f.client.snapshot.offerings
             f.queue()
             f.calls.clear()
@@ -119,7 +119,7 @@ class TargetingSyncTest {
     @Test fun offeringsFailureReturnsFailureEvenWithCacheAndDoesNotEraseIt() = runBlocking {
         Fixture().use { f ->
             f.configure()
-            f.client.refreshOfferings().success()
+            f.client.getOfferings().success()
             val cached = f.client.snapshot.offerings
             f.failOfferings = true
             assertTrue(f.client.syncAttributesAndOfferingsIfNeeded() is InappifyResult.Failure)
@@ -186,7 +186,7 @@ class TargetingSyncTest {
             val syncing = async(start = CoroutineStart.UNDISPATCHED) { f.client.syncAttributesAndOfferingsIfNeeded() }
             withTimeout(2_000) { entered.await() }
             val login = async(start = CoroutineStart.UNDISPATCHED) {
-                f.client.login(InappifyLoginRequest("customer_other_123456"))
+                f.client.logIn("customer_other_123456")
             }
             assertFalse(f.calls.contains("login"))
             release.complete(Unit)
@@ -203,8 +203,8 @@ class TargetingSyncTest {
             f.configure()
             repeat(5) { f.client.syncAttributesAndOfferingsIfNeeded().success() }
             f.catalog = "other-account"
-            f.client.login(InappifyLoginRequest("customer_other_123456")).success()
-            f.client.refreshOfferings().success()
+            f.client.logIn("customer_other_123456").success()
+            f.client.getOfferings().success()
             f.calls.clear()
             val result = f.client.syncAttributesAndOfferingsIfNeeded().success()
             assertEquals("other-account", result.data.offerings!!.single().identifier)
@@ -214,11 +214,11 @@ class TargetingSyncTest {
         }
     }
 
-    @Test fun contextInvalidationDoesNotReviveOldCacheAtTheLimit() = runBlocking {
+    @Test fun attributeInvalidationDoesNotReviveOldCacheAtTheLimit() = runBlocking {
         Fixture().use { f ->
             f.configure()
             repeat(5) { f.client.syncAttributesAndOfferingsIfNeeded().success() }
-            f.client.setTargetingContext(country = "DE").success()
+            f.queue()
             f.calls.clear()
             val failure = f.client.syncAttributesAndOfferingsIfNeeded() as InappifyResult.Failure
             assertEquals("RATE_LIMITED_NO_CACHE", failure.error.details["reason"])
@@ -234,9 +234,8 @@ class TargetingSyncTest {
             f.calls.clear()
             f.client.syncAttributesAndOfferingsIfNeeded().success()
             // Acquiring the client mutex again drains any incorrectly scheduled extra refresh.
-            f.client.setTargetingContext(country = "DE").success()
+            f.client.canSetReservedAttribute("\$email").success()
             assertEquals(1, f.calls.count { it == "offerings" })
-            assertNull(f.client.snapshot.forceVersion)
         }
     }
 
@@ -245,7 +244,7 @@ class TargetingSyncTest {
             f.configure()
             repeat(5) { f.client.syncAttributesAndOfferingsIfNeeded().success() }
             f.offline = true
-            assertTrue(f.client.logout() is InappifyResult.Failure)
+            assertTrue(f.client.logOut() is InappifyResult.Failure)
             f.calls.clear()
             val result = f.client.syncAttributesAndOfferingsIfNeeded()
             assertTrue(result is InappifyResult.Failure)
@@ -312,7 +311,7 @@ class TargetingSyncTest {
             client.configure(InappifyOptions("fixture-key", appUserIdentifier = signing.subject)).success()
         }
         suspend fun queue() {
-            (client as InappifyV2Client).queueAttributes(mapOf("tier" to "gold")).success()
+            (client as GoV2Client).enqueueAttributes(mapOf("tier" to "gold")).success()
         }
         override fun close() = client.close()
     }

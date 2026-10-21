@@ -31,7 +31,7 @@ class GoAutomaticStoreRecoveryTest {
 
     @Test fun payloadlessSubscriptionRecoveryIsEnabledWithoutAnAppOption() = runBlocking {
         val fixture = Fixture()
-        assertTrue(fixture.options.enableSubscriptionRecoveryWithoutPayload)
+        assertTrue(fixture.recoveryEnabled)
         fixture.seedConfiguredSession()
         fixture.owned[StoreProductType.SUBSCRIPTION] = StorePurchaseQueryResult.Success(listOf(fixture.unboundReceipt()))
         fixture.acceptRecovery()
@@ -177,8 +177,7 @@ class GoAutomaticStoreRecoveryTest {
         fixture.commerceTransport.handler = { fixture.commerceTransport.failureResponse(503) }
         assertTrue(fixture.automaticRecovery() is InappifyResult.Failure)
         val saved = fixture.storage.operations.single()
-        fixture.options = InappifyOptions("public-fixture-key", fixture.signing.subject,
-            enableSubscriptionRecoveryWithoutPayload = false)
+        fixture.recoveryEnabled = false
         fixture.owned.clear()
         fixture.commerceTransport.requests.clear()
         assertTrue(fixture.automaticRecovery() is InappifyResult.Failure)
@@ -227,7 +226,7 @@ class GoAutomaticStoreRecoveryTest {
         assertTrue(fixture.commerceTransport.requests.isEmpty())
         fixture.client(backgroundRecovery = false).use { sdk ->
             assertTrue(sdk.configure(fixture.options) is InappifyResult.Success)
-            assertTrue(sdk.restorePurchases() is InappifyResult.Success)
+            assertTrue(sdk.restoreStorePurchases() is InappifyResult.Success)
         }
         assertEquals("store/subscriptions/recover", fixture.commerceTransport.requests.single().path)
     }
@@ -695,7 +694,7 @@ class GoAutomaticStoreRecoveryTest {
 
         fixture.client(backgroundRecovery = false).use { sdk ->
             assertTrue(sdk.configure(fixture.options) is InappifyResult.Success)
-            assertTrue(sdk.syncPurchases() is InappifyResult.Success)
+            assertTrue(sdk.syncStorePurchases() is InappifyResult.Success)
         }
 
         assertEquals(listOf(StoreProductType.SUBSCRIPTION, StoreProductType.IN_APP), fixture.queried)
@@ -705,9 +704,8 @@ class GoAutomaticStoreRecoveryTest {
     private class Fixture(val market: InappifyMarket = InappifyMarket.BAZAAR, recoveryEnabled: Boolean? = null) {
         val signing = SigningFixture()
         val token = "automatic-recovery-store-token"
-        var options = if (recoveryEnabled == null) InappifyOptions("public-fixture-key", signing.subject)
-            else InappifyOptions("public-fixture-key", signing.subject,
-                enableSubscriptionRecoveryWithoutPayload = recoveryEnabled)
+        val options = InappifyOptions("public-fixture-key", signing.subject)
+        var recoveryEnabled = recoveryEnabled ?: true
         val storage = RecoveryStore()
         val events = CopyOnWriteArrayList<String>()
         val sdkTransport = RecordingTransport { events += "sdk:$it" }
@@ -775,6 +773,7 @@ class GoAutomaticStoreRecoveryTest {
             AppMetadataProvider { AppMetadata("com.example.mobile", "3.5.0", 4040) },
             { signing.now }, Dispatchers.Unconfined, backgroundRecovery = backgroundRecovery,
             commerceApi = GoApi(commerceTransport, { signing.now }, {}),
+            subscriptionRecoveryEnabled = recoveryEnabled,
             billingFactory = StoreBillingAdapterFactory { selected, key ->
                 assertEquals(market, selected)
                 assertEquals("fixture-public-rsa", key)

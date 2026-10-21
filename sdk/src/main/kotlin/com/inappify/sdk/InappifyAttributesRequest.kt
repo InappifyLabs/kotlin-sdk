@@ -1,45 +1,5 @@
 package com.inappify.sdk
 
-import java.util.ArrayList
-import java.util.Collections
-
-/**
- * Immutable custom-attribute update.
- *
- * The production client validates the complete request before queueing writes;
- * invalid keys or values fail it. Null or empty-string values delete a key.
- * [idempotencyKey] is reserved for correlation and is not sent to the endpoint.
- */
-public class InappifyAttributesRequest @JvmOverloads public constructor(
-    attributes: List<InappifyAttribute>,
-    public val idempotencyKey: String? = null,
-) {
-
-    /** Defensive, unmodifiable copy of the requested attribute changes. */
-    public val attributes: List<InappifyAttribute> =
-        Collections.unmodifiableList(ArrayList(attributes))
-
-    /** Redacts all customer-owned attribute data. */
-    public override fun toString(): String =
-        "InappifyAttributesRequest(" +
-            "attributes=${attributes.redactedCollection()}, " +
-            "idempotencyKey=${idempotencyKey.redactedValue()}" +
-            ")"
-}
-
-/** Immutable request for deleting custom attributes by key. */
-public class InappifyDeleteAttributesRequest public constructor(
-    keys: List<String>,
-) {
-
-    /** Defensive, unmodifiable copy of the requested keys. */
-    public val keys: List<String> = Collections.unmodifiableList(ArrayList(keys))
-
-    /** Redacts customer-defined attribute keys. */
-    public override fun toString(): String =
-        "InappifyDeleteAttributesRequest(keys=${keys.redactedCollection()})"
-}
-
 /** Reserved customer attributes supported by Inappify. */
 public enum class InappifyReservedAttribute {
     EMAIL,

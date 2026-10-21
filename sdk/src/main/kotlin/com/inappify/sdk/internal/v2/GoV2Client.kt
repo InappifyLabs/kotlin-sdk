@@ -2,6 +2,8 @@ package com.inappify.sdk.internal.v2
 
 import android.app.Activity
 import android.content.Context
+import android.content.pm.ApplicationInfo
+import com.inappify.sdk.internal.InappifyLogger
 import com.google.gson.*
 import com.inappify.sdk.*
 import com.inappify.sdk.internal.domain.InappifyDomainJsonCodec
@@ -19,7 +21,9 @@ import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.EmptyCoroutineContext
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import okhttp3.OkHttpClient
@@ -41,6 +45,12 @@ internal class GoV2Client(
             "Native store billing is unavailable."))
     },
     private val targetingSyncLimiter: TargetingSyncRateLimiter = TargetingSyncRateLimiter(),
+    private val subscriptionRecoveryEnabled: Boolean = true,
+    private val foregroundMonitor: AppForegroundMonitor = AlwaysForegroundMonitor(),
+    private val offeringsRefreshPolicy: OfferingsRefreshPolicy = OfferingsRefreshPolicy(),
+    private val connectivityMonitor: NetworkConnectivityMonitor = AlwaysConnectedMonitor(),
+    private val recoveryRefreshPolicy: RecoveryRefreshPolicy = RecoveryRefreshPolicy(),
+    private val paymentLinkMonitor: PaymentLinkMonitor = NoPaymentLinkMonitor(),
 ) : InappifyV2Client, StoreV2CapableClient, ConsumableFulfillmentCapableClient, HttpDiagnosticsCapableClient,
     InappifyV2RuntimeCapabilities, TargetingSyncCapableClient {
     constructor(config: InappifyV2Configuration, sdkApi: GoApi, storage: SessionStateStore,
@@ -50,13 +60,31 @@ internal class GoV2Client(
         billingFactory: StoreBillingAdapterFactory = StoreBillingAdapterFactory { _, _ ->
             UnsupportedStoreBillingAdapter(StoreBillingError(StoreBillingErrorCode.UNSUPPORTED_MARKET,
                 "Native store billing is unavailable."))
-        }, targetingSyncLimiter: TargetingSyncRateLimiter = TargetingSyncRateLimiter()) :
+        }, targetingSyncLimiter: TargetingSyncRateLimiter = TargetingSyncRateLimiter(),
+        subscriptionRecoveryEnabled: Boolean = true,
+        foregroundMonitor: AppForegroundMonitor = AlwaysForegroundMonitor(),
+        offeringsRefreshPolicy: OfferingsRefreshPolicy = OfferingsRefreshPolicy(),
+        connectivityMonitor: NetworkConnectivityMonitor = AlwaysConnectedMonitor(),
+        recoveryRefreshPolicy: RecoveryRefreshPolicy = RecoveryRefreshPolicy(),
+        paymentLinkMonitor: PaymentLinkMonitor = NoPaymentLinkMonitor()) :
         this(GoV2Environment.explicit(config), sdkApi, storage, metadata, now, eventDispatcher, backgroundRecovery,
-            countryResolver, commerceApi, billingFactory, targetingSyncLimiter)
+            countryResolver, commerceApi, billingFactory, targetingSyncLimiter, subscriptionRecoveryEnabled,
+            foregroundMonitor, offeringsRefreshPolicy, connectivityMonitor, recoveryRefreshPolicy, paymentLinkMonitor)
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val mutex = Mutex()
     private val flights = mutableMapOf<String, Deferred<*>>()
+    @Volatile private var recoveryGeneration = 0L
+    private var recoveryIdentity: String? = null
+    private var recoverySubject: String? = null
+    private val recoveryCoordinator = RecoveryCoordinator(scope, { recoveryGeneration }, ::recoverOnce)
+    private class PendingReturn(val link: PaymentReturnLink, val preceding: RecoveryCoordinator.Flight?) {
+        var following: RecoveryCoordinator.Flight? = null
+    }
+    private val paymentReturnLock = Any()
+    private val pendingReturns = linkedMapOf<PaymentReturnLink, PendingReturn>()
+    private val handledReturns = linkedSetOf<PaymentReturnLink>()
+    private val paymentReturnWakeups = Channel<Unit>(Channel.CONFLATED)
     private val listeners = CopyOnWriteArraySet<InappifyEventListener>()
     private var trustedTimeFloor = 0L
     private var timeAnchorNanos = System.nanoTime()
@@ -76,12 +104,28 @@ internal class GoV2Client(
             unregisterActiveAdapter = { adapter -> synchronized(lifecycleLock) { activeBillingAdapters.remove(adapter) }; Unit })
     }
     @Volatile private var closed = false
-    @Volatile private var currentSnapshot = InappifySnapshot.initial(BuildConfig.SDK_VERSION, forceVersion = null)
+    @Volatile private var currentSnapshot = InappifySnapshot.initial(BuildConfig.SDK_VERSION)
     @Volatile private var pendingLogout = false
     @Volatile private var pendingLogin = false
     @Volatile private var authenticatedScope: InappifyV2SessionScope? = null
     override val snapshot: InappifySnapshot get() = currentSnapshot
-    override val hasForceUpdate: Boolean get() = false
+
+    init {
+        scope.launch {
+            for (ignored in paymentReturnWakeups) {
+                try { recoverPaymentReturns() }
+                catch (cancelled: CancellationException) { throw cancelled }
+                catch (_: Exception) { /* Retain the hint for the next lifecycle/network trigger. */ }
+            }
+        }
+        paymentLinkMonitor.setListener { handleDeepLink(it); Unit }
+        foregroundMonitor.setListener { foreground -> if (foreground) {
+            scheduleRecoveryIfNeeded()
+            scheduleOfferingsRefresh()
+            scheduleCustomerInfoRefresh()
+        } }
+        connectivityMonitor.setListener { connected -> if (connected) scheduleRecoveryIfNeeded() }
+    }
     override val isLogoutPending: Boolean get() = pendingLogout
     override val verifiedScope: InappifyV2SessionScope?
         get() = authenticatedScope.takeIf { snapshot.isConfigured && !pendingLogout && !pendingLogin }
@@ -99,9 +143,18 @@ internal class GoV2Client(
         try {
             mutex.withLock {
                 currentCoroutineContext().ensureActive()
-                try { InappifyResult.Success(action(), snapshot) }
+                try {
+                    // A queued stage from a previous identity must not run against the new session.
+                    currentCoroutineContext()[RecoveryPass]?.let {
+                        if (it.generation != recoveryGeneration) fail("AUTH", "RECOVERY_SUPERSEDED")
+                    }
+                    InappifyResult.Success(action(), snapshot)
+                }
                 catch (e: CancellationException) { throw e }
-                catch (e: V2Failure) { InappifyResult.Failure(e.sdkError, snapshot) }
+                catch (e: V2Failure) {
+                    InappifyLogger.log(InappifyLogLevel.ERROR) { "SDK operation failed (${e.sdkError.code.name})." }
+                    InappifyResult.Failure(e.sdkError, snapshot)
+                }
                 catch (_: Exception) { InappifyResult.Failure(InappifyError(
                     InappifyErrorCode.MALFORMED_RESPONSE, "Inappify v2 returned an invalid response."), snapshot) }
             }
@@ -127,10 +180,13 @@ internal class GoV2Client(
     @Suppress("UNCHECKED_CAST")
     private suspend fun <T> shared(key: String, action: suspend () -> InappifyResult<T>): InappifyResult<T> {
         check(!closed)
+        val recoveryPass = currentCoroutineContext()[RecoveryPass]
+        if (recoveryPass != null && recoveryPass.generation != recoveryGeneration)
+            return run { fail("AUTH", "RECOVERY_SUPERSEDED") }
         val job = synchronized(flights) {
             val existing = flights[key]
             if (existing != null && !existing.isCompleted) existing as Deferred<InappifyResult<T>>
-            else scope.async(start = CoroutineStart.LAZY) { action() }.also { fresh ->
+            else scope.async(recoveryPass ?: EmptyCoroutineContext, start = CoroutineStart.LAZY) { action() }.also { fresh ->
                 flights[key] = fresh
                 fresh.invokeOnCompletion { synchronized(flights) { if (flights[key] === fresh) flights.remove(key) } }
                 fresh.start()
@@ -140,7 +196,8 @@ internal class GoV2Client(
     }
 
     override suspend fun configure(options: InappifyOptions): InappifyResult<Unit> =
-        shared("configure:${fingerprint(options)}:${options.appUserIdentifier}:${options.country}:${options.appVersion}:${options.enableSubscriptionRecoveryWithoutPayload}") { run {
+        shared("configure:${fingerprint(options)}:${options.appUserIdentifier}") { run {
+            InappifyLogger.log(InappifyLogLevel.DEBUG) { "Configuring SDK session." }
             validateOptions(options)
             if (this.options != null && fingerprint(this.options!!) != fingerprint(options))
                 fail("CONFIGURATION", "CREATE_NEW_CLIENT_FOR_APP_CHANGE")
@@ -197,8 +254,8 @@ internal class GoV2Client(
                 return@run
             }
             val session = document.getAsJsonObject("session")
-            val country = normalizeCountry(options.country ?: document.get("country")?.asString ?: "IR")
-            val appVersion = options.appVersion ?: metadata.get().versionName
+            val country = normalizeCountry(document.get("country")?.asString ?: "IR")
+            val appVersion = metadata.get().versionName
             val contextChanged = session != null &&
                 (document.get("country")?.asString != country || document.get("appVersion")?.asString != appVersion)
             val reusesIdentity = session != null &&
@@ -279,11 +336,11 @@ internal class GoV2Client(
         preservePendingLogout: Boolean = pendingLogout, retry: Boolean = true) {
         val opt = options ?: fail("CONFIGURATION", "NOT_CONFIGURED")
         val app = metadata.get()
-        val country = opt.country ?: document.get("country")?.asString ?: resolveCountry()
+        val country = document.get("country")?.asString ?: resolveCountry()
         val response = sdkApi.request("configure", opt.apiKey, JsonObject().apply {
             addProperty("appUserIdentifier", identity)
             addProperty("identifierValue", app.packageIdentifier)
-            addProperty("versionName", opt.appVersion ?: app.versionName)
+            addProperty("versionName", app.versionName)
             addProperty("versionCode", app.versionCode)
             addProperty("sdkVersion", BuildConfig.SDK_VERSION)
             addProperty("country", normalizeCountry(country))
@@ -344,8 +401,8 @@ internal class GoV2Client(
         if (keepLoginPending) document.getAsJsonObject("pendingLogin")?.let { next.add("pendingLogin", it.deepCopy()) }
         else next.remove("pendingLogin")
         next.addProperty("infoFetchedAt", now())
-        next.addProperty("country", normalizeCountry(configuredCountry ?: options?.country ?: document.get("country")?.asString ?: "IR"))
-        next.addProperty("appVersion", options?.appVersion ?: metadata.get().versionName)
+        next.addProperty("country", normalizeCountry(configuredCountry ?: document.get("country")?.asString ?: "IR"))
+        next.addProperty("appVersion", metadata.get().versionName)
         if (keepLogoutPending) {
             next.addProperty("pendingLogout", true)
             document.getAsJsonObject("pendingLogoutAttempt")?.let {
@@ -391,14 +448,14 @@ internal class GoV2Client(
         }
     }
 
-    override suspend fun login(request: InappifyLoginRequest): InappifyResult<Unit> = run {
-        if (!validIdentity(request.appUserIdentifier) || isAnonymous(request.appUserIdentifier))
+    override suspend fun logIn(appUserIdentifier: String): InappifyResult<Unit> = run {
+        if (!validIdentity(appUserIdentifier) || isAnonymous(appUserIdentifier))
             fail("VALIDATION", "APP_USER_ID_INVALID")
         if (pendingLogout) fail("AUTH", "LOGOUT_PENDING")
         if (!sdkApi.enabled) fail("CONFIGURATION", "V2_DISABLED")
         val pending = document.getAsJsonObject("pendingLogin")
         if (pending != null) {
-            if (pending.string("appUserId") != request.appUserIdentifier) fail("AUTH", "LOGIN_PENDING")
+            if (pending.string("appUserId") != appUserIdentifier) fail("AUTH", "LOGIN_PENDING")
         } else {
             val session = document.getAsJsonObject("session") ?: fail("CONFIGURATION", "NOT_CONFIGURED")
             if (document.get("sessionInvalid")?.asBoolean == true ||
@@ -407,7 +464,7 @@ internal class GoV2Client(
             }
             commit(document.deepCopy().apply {
                 add("pendingLogin", JsonObject().apply {
-                    addProperty("appUserId", request.appUserIdentifier)
+                    addProperty("appUserId", appUserIdentifier)
                     addProperty("attemptId", UUID.randomUUID().toString())
                 })
             })
@@ -441,7 +498,7 @@ internal class GoV2Client(
             acceptSession(response, target, identityTransition = true)
         }
     }
-    override suspend fun logout(): InappifyResult<Unit> = run { logoutLocked() }
+    override suspend fun logOut(): InappifyResult<Unit> = run { logoutLocked() }
     private suspend fun logoutLocked(allowFreshPredecessor: Boolean = true) {
         if (pendingLogin) fail("AUTH", "LOGIN_PENDING")
         if (!sdkApi.enabled) fail("CONFIGURATION", "V2_DISABLED")
@@ -505,9 +562,23 @@ internal class GoV2Client(
         scheduleRecovery()
     }
 
-    override suspend fun getCustomerInfo(forceRefresh: Boolean): InappifyResult<InappifyCustomerInfo> =
-        customerInfo(if (forceRefresh) InappifyFetchPolicy.NETWORK_ONLY else InappifyFetchPolicy.CACHE_FIRST)
-    override suspend fun refreshCustomerInfo(): InappifyResult<InappifyCustomerInfo> =
+    override suspend fun getCustomerInfo(fetchPolicy: InappifyCacheFetchPolicy): InappifyResult<InappifyCustomerInfo> {
+        val cached = snapshot.customerInfo
+        InappifyLogger.log(InappifyLogLevel.DEBUG) { "Reading CustomerInfo with ${fetchPolicy.name}; cache ${if (cached == null) "absent" else "available"}." }
+        return when (fetchPolicy) {
+            InappifyCacheFetchPolicy.CACHE_ONLY -> customerInfo(InappifyFetchPolicy.CACHE_ONLY)
+            InappifyCacheFetchPolicy.FETCH_CURRENT -> refreshCustomerInfo()
+            InappifyCacheFetchPolicy.NOT_STALE_CACHED_OR_CURRENT ->
+                if (cached != null && !isCustomerInfoStale()) InappifyResult.Success(cached, snapshot)
+                else fetchCustomerInfo(onlyIfStale = true)
+            InappifyCacheFetchPolicy.CACHED_OR_FETCHED -> if (cached != null) {
+                scheduleCustomerInfoRefresh()
+                InappifyResult.Success(cached, snapshot)
+            } else fetchCustomerInfo(onlyIfStale = true)
+        }
+    }
+
+    private suspend fun refreshCustomerInfo(): InappifyResult<InappifyCustomerInfo> =
         customerInfo(InappifyFetchPolicy.NETWORK_ONLY)
     override suspend fun customerInfo(policy: InappifyFetchPolicy): InappifyResult<InappifyCustomerInfo> {
         val cached = snapshot.customerInfo
@@ -516,21 +587,40 @@ internal class GoV2Client(
             return InappifyResult.Success(cached, snapshot)
         }
         if (policy == InappifyFetchPolicy.CACHE_ONLY) return run { fail("CONFIGURATION", "CACHE_MISS") }
-        val result = shared("customer:${snapshot.appUserIdentifier}") { run {
-            val response = sessionRequest("customerInfo")
-            val info = verifiedResponse("customerInfo") {
-                verify(response, document.getAsJsonObject("session").string("appUserId"))
-            }
-            val parsed = InappifyDomainJsonCodec.parseCustomerInfo(info.toString())
-            commit(document.deepCopy().apply { add("info", response); addProperty("infoFetchedAt", now()) })
-            parsed
-        } }
+        val result = fetchCustomerInfo()
         return if (policy == InappifyFetchPolicy.NETWORK_FIRST && result is InappifyResult.Failure &&
             snapshot.customerInfo != null) InappifyResult.Success(snapshot.customerInfo!!, snapshot) else result
     }
 
+    private suspend fun fetchCustomerInfo(onlyIfStale: Boolean = false): InappifyResult<InappifyCustomerInfo> =
+        shared("customer:${snapshot.appUserIdentifier}") { run {
+            requireSession()
+            if (onlyIfStale && snapshot.customerInfo != null && !isCustomerInfoStale())
+                return@run snapshot.customerInfo!!
+            val response = sessionRequest("customerInfo")
+            val info = verifiedResponse("customerInfo") {
+                verify(response, document.getAsJsonObject("session").string("appUserId"))
+            }
+            val parsed = InappifyDomainJsonCodec.parseCustomerInfo(info.toString()).withEntitlementClock(::trustedNow)
+            commit(document.deepCopy().apply { add("info", response); addProperty("infoFetchedAt", now()) })
+            parsed
+        } }
+
+    private fun isCustomerInfoStale(): Boolean {
+        val fetchedAt = document.get("infoFetchedAt")?.asLong ?: return true
+        val at = now()
+        val lifetime = if (foregroundMonitor.isForeground) TimeUnit.MINUTES.toMillis(5)
+            else TimeUnit.HOURS.toMillis(25)
+        return at < fetchedAt || at - fetchedAt >= lifetime
+    }
+
+    private fun scheduleCustomerInfoRefresh() {
+        if (!closed && backgroundRecovery && snapshot.isConfigured &&
+            sdkApi.enabled && isCustomerInfoStale()) scope.launch { fetchCustomerInfo(onlyIfStale = true) }
+    }
+
     override suspend fun getOfferings(): InappifyResult<InappifyOfferings> = offerings(InappifyFetchPolicy.CACHE_FIRST)
-    override suspend fun refreshOfferings(): InappifyResult<InappifyOfferings> = offerings(InappifyFetchPolicy.NETWORK_ONLY)
+    internal suspend fun refreshOfferings(): InappifyResult<InappifyOfferings> = offerings(InappifyFetchPolicy.NETWORK_ONLY)
 
     override suspend fun syncAttributesAndOfferingsIfNeededInternal(): InappifyResult<InappifyOfferings> = run {
         requireSession()
@@ -549,17 +639,22 @@ internal class GoV2Client(
 
     override suspend fun offerings(policy: InappifyFetchPolicy): InappifyResult<InappifyOfferings> {
         val cached = snapshot.offerings
+        InappifyLogger.log(InappifyLogLevel.DEBUG) { "Reading Offerings with ${policy.name}; cache ${if (cached == null) "absent" else "available"}." }
         if (cached != null && policy in setOf(InappifyFetchPolicy.CACHE_ONLY, InappifyFetchPolicy.CACHE_FIRST)) {
-            if (policy == InappifyFetchPolicy.CACHE_FIRST && backgroundRecovery) scope.launch { refreshOfferings() }
+            if (policy == InappifyFetchPolicy.CACHE_FIRST) scheduleOfferingsRefresh()
             return InappifyResult.Success(cached, snapshot)
         }
         if (policy == InappifyFetchPolicy.CACHE_ONLY) return run { fail("CONFIGURATION", "CACHE_MISS") }
-        val result = shared("offerings:${snapshot.appUserIdentifier}") { run { fetchOfferingsLocked() } }
+        val result = shared("offerings:${snapshot.appUserIdentifier}") { run {
+            // A foreground prefetch may have populated the cache while this read waited for the mutex.
+            if (policy == InappifyFetchPolicy.CACHE_FIRST && snapshot.offerings != null) snapshot.offerings!!
+            else fetchOfferingsLocked()
+        } }
         return if (policy == InappifyFetchPolicy.NETWORK_FIRST && result is InappifyResult.Failure &&
             snapshot.offerings != null) InappifyResult.Success(snapshot.offerings!!, snapshot) else result
     }
 
-    private suspend fun fetchOfferingsLocked(): InappifyOfferings {
+    private suspend fun fetchOfferingsLocked(): InappifyOfferings = try {
         flushAttributesLocked()
         val response = sessionRequest("offerings", JsonObject().apply {
             addProperty("appVersion", snapshot.appVersion ?: metadata.get().versionName)
@@ -575,11 +670,29 @@ internal class GoV2Client(
         }
         val parsed = InappifyDomainJsonCodec.parseOfferings(safe.toString())
         commit(document.deepCopy().apply { add("offerings", safe) })
-        return parsed
+        offeringsRefreshPolicy.fetched()
+        parsed
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (failure: Exception) {
+        offeringsRefreshPolicy.failed()
+        throw failure
     }
-    override suspend fun getCurrentOffering(placementIdentifier: String?, forceRefresh: Boolean,
-        context: InappifyOfferingEvaluationContext?): InappifyResult<InappifyOffering?> {
-        val fetched = if (forceRefresh) refreshOfferings() else getOfferings()
+
+    private fun scheduleOfferingsRefresh() {
+        if (!closed && backgroundRecovery && snapshot.isConfigured && foregroundMonitor.isForeground &&
+            sdkApi.enabled && offeringsRefreshPolicy.shouldRefresh()) scope.launch { refreshOfferingsIfNeeded() }
+    }
+
+    private suspend fun refreshOfferingsIfNeeded(): InappifyResult<InappifyOfferings?> =
+        shared("automatic-offerings:${snapshot.appUserIdentifier}") { run {
+            // Recheck after serialization: a preceding request may have fetched or invalidated this catalog.
+            if (!snapshot.isConfigured || pendingLogin || pendingLogout || !foregroundMonitor.isForeground ||
+                !sdkApi.enabled || !offeringsRefreshPolicy.shouldRefresh()) snapshot.offerings
+            else fetchOfferingsLocked()
+        } }
+    override suspend fun getCurrentOffering(placementIdentifier: String?): InappifyResult<InappifyOffering?> {
+        val fetched = getOfferings()
         if (fetched is InappifyResult.Failure) return fetched
         return run {
             val raw = document.getAsJsonObject("offerings")
@@ -592,18 +705,11 @@ internal class GoV2Client(
                 ?: items.firstOrNull { it.isDefault == true }
         }
     }
-    override suspend fun setTargetingContext(country: String?, appVersion: String?): InappifyResult<Unit> = run {
-        requireSession()
-        if (country != null && !validCountry(country)) fail("VALIDATION", "INVALID_COUNTRY")
-        if (appVersion != null && (appVersion.isBlank() || appVersion.length > 50)) fail("VALIDATION", "INVALID_VERSION")
-        commit(document.deepCopy().apply {
-            country?.let { addProperty("country", normalizeCountry(it)) }; appVersion?.let { addProperty("appVersion", it) }
-            remove("offerings")
+    override suspend fun getDiscountedPaymentLinks(discountCode: String): InappifyResult<InappifyDiscountCodeResult> = run {
+        val response = sessionRequest("validateDiscountCode", JsonObject().apply {
+            addProperty("code", discountCode)
+            addProperty("paymentReturnVersion", 1)
         })
-    }
-
-    override suspend fun validateDiscountCode(request: InappifyDiscountCodeRequest): InappifyResult<InappifyDiscountCodeResult> = run {
-        val response = sessionRequest("validateDiscountCode", JsonObject().apply { addProperty("code", request.discountCode) })
         val data = response.getAsJsonObject("data") ?: fail("DECODING", "INVALID_DISCOUNT")
         data.flag("is_valid"); data.number("error_code")
         val result = InappifyDomainJsonCodec.parseDiscountCodeResult(data.toString())
@@ -611,7 +717,7 @@ internal class GoV2Client(
         result
     }
 
-    override suspend fun queueAttributes(values: Map<String, String?>): InappifyResult<Unit> = run {
+    internal suspend fun enqueueAttributes(values: Map<String, String?>): InappifyResult<Unit> = run {
         requireSession()
         values.forEach { (key, value) ->
             if (!validAttribute(key, value)) fail("VALIDATION", "ATTRIBUTE_INVALID")
@@ -622,9 +728,9 @@ internal class GoV2Client(
         if (queue.size() > 1000) fail("VALIDATION", "ATTRIBUTE_QUEUE_FULL")
         next.remove("offerings")
         commit(next)
-        if (backgroundRecovery) scope.launch { delay(300); flushAttributes() }
+        if (backgroundRecovery) scope.launch { delay(300); flushQueuedAttributes() }
     }
-    override suspend fun flushAttributes(): InappifyResult<Unit> = shared("attributes:${snapshot.appUserIdentifier}") { run { flushAttributesLocked() } }
+    internal suspend fun flushQueuedAttributes(): InappifyResult<Unit> = shared("attributes:${snapshot.appUserIdentifier}") { run { flushAttributesLocked() } }
     private suspend fun flushAttributesLocked() {
         requireSession()
         while (true) {
@@ -646,25 +752,19 @@ internal class GoV2Client(
             commit(document.deepCopy().apply { entries.forEach { getAsJsonObject("attributes").remove(it.key) } })
         }
     }
-    override suspend fun setAttributes(request: InappifyAttributesRequest): InappifyResult<List<InappifyAttribute>> {
-        val queued = queueAttributes(request.attributes.associate { (it.key ?: "") to it.value })
+    override suspend fun setAttributes(attributes: Map<String, String?>): InappifyResult<List<InappifyAttribute>> {
+        // Capture caller-owned values before waiting for the operation mutex, as the old request adapter did.
+        val queued = enqueueAttributes(attributes.toMap())
         return when (queued) {
             is InappifyResult.Failure -> queued
-            is InappifyResult.Success -> when (val flushed = flushAttributes()) {
+            is InappifyResult.Success -> when (val flushed = flushQueuedAttributes()) {
                 is InappifyResult.Failure -> flushed
                 is InappifyResult.Success -> InappifyResult.Success(emptyList(), snapshot)
             }
         }
     }
-    override suspend fun deleteAttributes(request: InappifyDeleteAttributesRequest): InappifyResult<List<InappifyAttribute>> =
-        setAttributes(InappifyAttributesRequest(request.keys.map { InappifyAttribute(it, null) }))
-    override suspend fun syncAttributes(request: InappifyAttributesRequest?): InappifyResult<List<InappifyAttribute>> =
-        if (request != null) setAttributes(request) else when (val result = flushAttributes()) {
-            is InappifyResult.Failure -> result
-            is InappifyResult.Success -> InappifyResult.Success(emptyList(), snapshot)
-        }
     override suspend fun setReservedAttribute(request: InappifyReservedAttributeRequest): InappifyResult<Unit> =
-        when (val result = setAttributes(InappifyAttributesRequest(listOf(InappifyAttribute(request.attribute.backendKey, request.value))))) {
+        when (val result = setAttributes(mapOf(request.attribute.backendKey to request.value))) {
             is InappifyResult.Failure -> result
             is InappifyResult.Success -> InappifyResult.Success(Unit, snapshot)
         }
@@ -677,43 +777,161 @@ internal class GoV2Client(
     override fun isActiveEntitlement(identifier: String): Boolean = getEntitlement(identifier) != null
     override fun hasEntitlement(identifier: String): Boolean = isActiveEntitlement(identifier)
     override fun isCustomerAnonymous(appUserIdentifier: String?): Boolean = appUserIdentifier?.let(::isAnonymous) == true
-    override suspend fun checkEntitlement(identifier: String, forceRefresh: Boolean): InappifyResult<Boolean> =
-        when (val result = getCustomerInfo(forceRefresh)) {
-            is InappifyResult.Failure -> result
-            is InappifyResult.Success -> InappifyResult.Success(isActiveEntitlement(identifier), snapshot)
+    override suspend fun purchase(purchaseParams: InappifyPurchaseParams): InappifyResult<InappifyPurchase> {
+        InappifyLogger.log(InappifyLogLevel.DEBUG) { "Starting package purchase." }
+        val request = purchaseParams.toRequest()
+        val failureCode = when {
+            request == null -> "PURCHASE_PACKAGE_CONTEXT_REQUIRED"
+            request.productType == null && snapshot.storePlatform in setOf("Bazar", "MyKet") ->
+                "PRODUCT_TYPE_REQUIRED"
+            else -> null
         }
-
-    override suspend fun purchase(request: InappifyPurchaseRequest): InappifyResult<InappifyPurchase> = purchaseInternal(null, request)
-    override suspend fun purchase(activity: Activity, request: InappifyPurchaseRequest): InappifyResult<InappifyPurchase> = purchaseInternal(activity, request)
-    private suspend fun purchaseInternal(activity: Activity?, request: InappifyPurchaseRequest): InappifyResult<InappifyPurchase> {
-        val result = run {
-            requireSession()
-            if (request.apiKey != null || request.marketKey != null || request.isLostPurchase || request.dynamicPriceToken != null)
-                fail("VALIDATION", "PURCHASE_OVERRIDE_NOT_ALLOWED")
-            // A paid attempt owns its persisted offering/product binding. Catalog refreshes
-            // may remove that product, but must never force the caller to pay again.
-            if (nativeStoreMarket(snapshot.storePlatform) != null && request.idempotencyKey != null) {
-                val recovery = storage.loadPendingStoreRecoveryState()
-                    ?: fail("STORAGE", "STORE_RECOVERY_UNAVAILABLE")
-                if (recovery.operations.any { it.id == request.idempotencyKey })
-                    return@run purchaseStoreV2(activity, request, request.packageIdentifier)
-            }
-            val offering = snapshot.offerings?.offerings?.firstOrNull { it.identifier == request.offeringIdentifier }
-            val selectedPackage = offering?.packages?.firstOrNull { it.product?.identifier == request.productIdentifier &&
-                (request.packageIdentifier == null || it.identifier == request.packageIdentifier) }
-                ?: fail("VALIDATION", "PRODUCT_NOT_IN_OFFERING")
-            val purchase = when (snapshot.storePlatform) {
-                "DirectAndroid" -> purchaseDirectV2(request, selectedPackage.identifier)
-                "Bazar", "MyKet" -> purchaseStoreV2(activity, request, selectedPackage.identifier)
-                else -> fail("CONFIGURATION", "UNSUPPORTED_STORE_PLATFORM")
-            }
-            if (purchase.url != null && !allowedUrl(purchase.url, config.paymentHosts))
-                fail("DECODING", "UNTRUSTED_PAYMENT_URL", diagnostics = mapOf("outcomeMayHaveCommitted" to true))
-            purchase
-        }
-        if (result is InappifyResult.Success) refreshCustomerInfo()
-        return result.withSnapshot()
+        if (failureCode != null) return InappifyResult.Failure(
+            InappifyError(
+                InappifyErrorCode.INVALID_CONFIGURATION,
+                "The selected package is missing purchase metadata. Refresh offerings before purchasing.",
+                details = mapOf("operation" to "purchase", "category" to "VALIDATION", "serverCode" to failureCode),
+            ),
+            snapshot,
+        )
+        return purchaseInternal(purchaseParams.activity, request!!)
     }
+    private sealed interface PurchaseStep {
+        class Wait(val recovery: RecoveryCoordinator.Flight) : PurchaseStep
+        class Ready(val purchase: InappifyPurchase) : PurchaseStep
+    }
+    internal suspend fun purchaseInternal(activity: Activity?, request: InappifyPurchaseRequest): InappifyResult<InappifyPurchase> {
+        var binding: Triple<Long, String?, String?>? = null
+        val joined = mutableListOf<RecoveryPass>()
+        // Capture before waiting for the state mutex: recovery can finish and remove
+        // the paid checkpoint while this purchase is waiting to enter that mutex.
+        recoveryCoordinator.active()?.let { active ->
+            joined += active.pass
+            active.result.await()
+        }
+        while (true) {
+            val result = run {
+                requireSession()
+                val currentBinding = Triple(recoveryGeneration, snapshot.storePlatform, options?.let(::fingerprint))
+                if ((binding != null && binding != currentBinding) || joined.any { it.generation != recoveryGeneration })
+                    fail("CONFIGURATION", "PURCHASE_CONTEXT_CHANGED")
+                binding = currentBinding
+                if (request.apiKey != null || request.marketKey != null || request.isLostPurchase || request.dynamicPriceToken != null)
+                    fail("VALIDATION", "PURCHASE_OVERRIDE_NOT_ALLOWED")
+                validatePurchaseOptions(request)
+                // Never await recovery while holding its state mutex. Check admission here
+                // so a pass started while the purchase waited for this mutex is also joined.
+                recoveryCoordinator.active()?.let { active ->
+                    if (active.pass !in joined) return@run PurchaseStep.Wait(active)
+                }
+                recoveredPurchase(request, joined)?.let { return@run PurchaseStep.Ready(it) }
+                // A paid attempt owns its persisted offering/product binding. Catalog refreshes
+                // may remove that product, but must never force the caller to pay again.
+                if (nativeStoreMarket(snapshot.storePlatform) != null && request.idempotencyKey != null) {
+                    val recovery = storage.loadPendingStoreRecoveryState()
+                        ?: fail("STORAGE", "STORE_RECOVERY_UNAVAILABLE")
+                    if (recovery.operations.any { it.id == request.idempotencyKey })
+                        return@run PurchaseStep.Ready(purchaseStoreV2(activity, request, request.packageIdentifier))
+                }
+                pendingPurchase(request)?.let { return@run PurchaseStep.Ready(it) }
+                val offering = snapshot.offerings?.offerings?.firstOrNull { it.identifier == request.offeringIdentifier }
+                val selectedPackage = offering?.packages?.firstOrNull { it.product?.identifier == request.productIdentifier &&
+                    (request.packageIdentifier == null || it.identifier == request.packageIdentifier) }
+                    ?: fail("VALIDATION", "PRODUCT_NOT_IN_OFFERING")
+                val purchase = when (snapshot.storePlatform) {
+                    "DirectAndroid" -> purchaseDirectV2(request, selectedPackage.identifier)
+                    "Bazar", "MyKet" -> purchaseStoreV2(activity, request, selectedPackage.identifier)
+                    else -> fail("CONFIGURATION", "UNSUPPORTED_STORE_PLATFORM")
+                }
+                if (purchase.url != null && !allowedUrl(purchase.url, config.paymentHosts))
+                    fail("DECODING", "UNTRUSTED_PAYMENT_URL", diagnostics = mapOf("outcomeMayHaveCommitted" to true))
+                PurchaseStep.Ready(purchase)
+            }
+            when (result) {
+                is InappifyResult.Failure -> return result
+                is InappifyResult.Success -> when (val step = result.data) {
+                    is PurchaseStep.Wait -> {
+                        joined += step.recovery.pass
+                        // Catalog/info failure is not proof that a paid receipt is unresolved.
+                        // Only matching purchase outcomes/checkpoints decide below.
+                        step.recovery.result.await()
+                    }
+                    is PurchaseStep.Ready -> {
+                        refreshCustomerInfo()
+                        return InappifyResult.Success(step.purchase, snapshot)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun validatePurchaseOptions(request: InappifyPurchaseRequest) {
+        val market = nativeStoreMarket(snapshot.storePlatform)
+        if (market != null) {
+            if (request.country != null || request.appVersion != null || request.market !in setOf(InappifyMarket.NONE, market) ||
+                request.isCrypto || request.discount != 0L || request.discountCode != null ||
+                request.paywallId != null || request.paywallRevision != null)
+                fail("VALIDATION", "PURCHASE_OVERRIDE_NOT_ALLOWED")
+            if (market == InappifyMarket.MYKET && request.productType == InappifyProductType.SUBSCRIPTION)
+                fail("CONFIGURATION", "MYKET_SUBSCRIPTIONS_UNSUPPORTED")
+        } else if (snapshot.storePlatform == "DirectAndroid" && (request.country != null || request.appVersion != null ||
+                request.market != InappifyMarket.NONE || request.discount != 0L || request.discountCode != null))
+            fail("VALIDATION", "PURCHASE_OVERRIDE_NOT_ALLOWED")
+        if (request.idempotencyKey != null && !request.idempotencyKey.matches(Regex("[A-Za-z0-9_.:-]{1,128}")))
+            fail("VALIDATION", "PURCHASE_ATTEMPT_INVALID")
+    }
+
+    private fun recoveredPurchase(request: InappifyPurchaseRequest, joined: List<RecoveryPass>): InappifyPurchase? {
+        val recovered = joined.asReversed().flatMap { it.purchases().asReversed() }
+        val exact = request.idempotencyKey?.let { attempt -> recovered.firstOrNull { it.attemptId == attempt } }
+        if (exact != null && exact.productIdentifier != request.productIdentifier) fail("VALIDATION", "PURCHASE_ATTEMPT_CONFLICT")
+        exact?.nativeOperation?.let { operation ->
+            if (operation.operation != PendingStoreOperationType.PURCHASE ||
+                operation.productIdentifier != request.productIdentifier || operation.offeringIdentifier != request.offeringIdentifier ||
+                !compatibleRetryType(request.productType, operation.productType)) fail("VALIDATION", "PURCHASE_ATTEMPT_CONFLICT")
+        }
+        val previous = exact ?: recovered.firstOrNull { it.productIdentifier == request.productIdentifier } ?: return null
+        return when (val result = previous.result) {
+            is InappifyResult.Success -> result.data
+            is InappifyResult.Failure -> throw V2Failure(result.error)
+        }
+    }
+
+    /** Finish known paid work for this SKU without creating another store/payment attempt. */
+    private suspend fun pendingPurchase(request: InappifyPurchaseRequest): InappifyPurchase? {
+        if (snapshot.storePlatform == "DirectAndroid") {
+            val record = directRecords().entrySet().firstOrNull { (_, value) ->
+                val delivery = value.asJsonObject.getAsJsonObject("delivery")
+                delivery.string("productIdentifier") == request.productIdentifier && delivery.string("status") != "COMPLETED"
+            }?.value?.asJsonObject ?: return null
+            if (!sdkApi.enabled || commerceApi?.enabled == false) fail("CONFIGURATION", "V2_DISABLED")
+            val delivery = GoV2DirectDelivery(record.getAsJsonObject("delivery"))
+            // Only a previously committed host grant may acknowledge a delivery.
+            return if (record.flag("hostDelivered")) confirmDirectDelivery(delivery.id) else delivery.purchase()
+        }
+        val market = nativeStoreMarket(snapshot.storePlatform) ?: return null
+        val opt = options ?: return null
+        val session = document.getAsJsonObject("session") ?: return null
+        val recovery = storage.loadPendingStoreRecoveryState() ?: fail("STORAGE", "STORE_RECOVERY_UNAVAILABLE")
+        val pending = recovery.operations.firstOrNull { it.productIdentifier == request.productIdentifier &&
+            it.store == market.storeId && it.apiKeyFingerprint == storeFingerprint(opt) &&
+            it.customerIdentifierFingerprint == digest(session.string("appUserId")) &&
+            it.appId == session.number("appId") && it.appIdentifier == metadata.get().packageIdentifier } ?: return null
+        val context = storeContext()
+        if (context.marketKey.isNullOrBlank()) fail("CONFIGURATION", if (market == InappifyMarket.MYKET)
+            "MYKET_PUBLIC_KEY_REQUIRED" else "BAZAAR_PUBLIC_KEY_REQUIRED")
+        val coordinator = storeCoordinator ?: fail("CONFIGURATION", "LARAVEL_V2_NOT_CONFIGURED")
+        if (storeTombstone(pending, context) in recovery.rejectedEvidenceTombstones)
+            fail("VALIDATION", "STORE_EVIDENCE_PREVIOUSLY_REJECTED")
+        val outcome = coordinator.resume(pending, context, StoreV2Coordinator.MAX_FOREGROUND_POLLS)
+        finalizeRejectedStoreOutcome(outcome, context)
+        return storePurchaseResult(outcome, originalPackage(pending))
+    }
+
+    private fun originalPackage(operation: PendingStoreOperation): String? = runCatching {
+        JsonParser.parseString(operation.evidence.developerPayload).asJsonObject
+            .get("nativePackageIdentifier")?.takeUnless { it.isJsonNull }?.asString?.takeIf(String::isNotBlank)
+    }.getOrNull()
     private suspend fun purchaseDirectV2(request: InappifyPurchaseRequest, packageIdentifier: String?): InappifyPurchase {
         if (!sdkApi.enabled) fail("CONFIGURATION", "V2_DISABLED")
         requireSession()
@@ -727,7 +945,7 @@ internal class GoV2Client(
             commerceRequest("purchase", JsonObject().apply {
                 addProperty("productIdentifier", request.productIdentifier)
                 addProperty("offeringIdentifier", request.offeringIdentifier)
-                addProperty("isCrypto", request.isCrypto)
+                addProperty("paymentReturnVersion", 1)
                 request.paywallId?.let { addProperty("paywallId", it) }
                 request.paywallRevision?.let { addProperty("paywallRevision", it) }
             }).body
@@ -789,16 +1007,12 @@ internal class GoV2Client(
         val token = commerceSessionToken()
         val session = document.getAsJsonObject("session") ?: fail("CONFIGURATION", "NOT_CONFIGURED")
         val market = nativeStoreMarket(snapshot.storePlatform) ?: fail("CONFIGURATION", "UNSUPPORTED_STORE_PLATFORM")
-        if ((market == InappifyMarket.MYKET || opt.market == InappifyMarket.MYKET) &&
-            opt.market != null && opt.market != InappifyMarket.NONE && opt.market != market)
-            fail("CONFIGURATION", "MARKET_KEY_ROUTE_MISMATCH")
         return StoreV2Context(opt.apiKey, token, storeFingerprint(opt),
             digest(session.string("appUserId")), metadata.get().packageIdentifier,
             session.number("appId"), document.get("country")?.asString ?: "IR",
             document.get("appVersion")?.asString ?: metadata.get().versionName,
-            null, opt.marketKey?.takeIf(String::isNotBlank)
-                ?: session.get("storeInfo")?.takeUnless { it.isJsonNull }?.asString?.takeIf(String::isNotBlank), market,
-            subscriptionRecoveryEnabled = opt.enableSubscriptionRecoveryWithoutPayload)
+            session.get("storeInfo")?.takeUnless { it.isJsonNull }?.asString?.takeIf(String::isNotBlank), market,
+            subscriptionRecoveryEnabled = subscriptionRecoveryEnabled)
     }
     private fun storeFingerprint(value: InappifyOptions): String =
         goStoreFingerprint(fingerprint(value), config.commerceApiBaseUrl)
@@ -920,6 +1134,12 @@ internal class GoV2Client(
         }
         if (permanent && !storage.finalizePendingStoreOperationWithTombstone(outcome.operation.id,
                 storeTombstone(outcome.operation, context))) fail("STORAGE", "STORE_REJECTION_NOT_PERSISTED")
+        // Only waiting callers retain these outcomes; no terminal-purchase cache is created.
+        val pass = currentCoroutineContext()[RecoveryPass] ?: return
+        val observed = try {
+            InappifyResult.Success(storePurchaseResult(outcome, originalPackage(outcome.operation)), snapshot)
+        } catch (failure: V2Failure) { InappifyResult.Failure(failure.sdkError, snapshot) }
+        pass.record(RecoveredPurchase(outcome.operation.id, outcome.operation.productIdentifier, observed, outcome.operation))
     }
     private fun storePurchaseResult(outcome: StoreV2Outcome, packageIdentifier: String?): InappifyPurchase {
         val state = when (outcome) {
@@ -929,6 +1149,7 @@ internal class GoV2Client(
             is StoreV2Outcome.Rejected -> throw V2Failure(outcome.error)
             is StoreV2Outcome.Failure -> throw V2Failure(outcome.error)
         }
+        InappifyLogger.log(InappifyLogLevel.INFO) { "Store purchase status: ${state.status.name}." }
         return InappifyPurchase.storeResult(outcome.operation.id, outcome.operation.productIdentifier,
             outcome.operation.offeringIdentifier.orEmpty(), packageIdentifier,
             InappifyStorePurchaseStatus.fromServerValue(state.status.wireValue),
@@ -1280,9 +1501,12 @@ internal class GoV2Client(
             pending[delivery.id] = delivery.publicDelivery()
             handled += delivery.id
             try {
-                purchases[delivery.id] = confirmDirectDelivery(delivery.id)
+                purchases[delivery.id] = observeDirectRecovery(confirmDirectDelivery(delivery.id))
                 pending.remove(delivery.id); completed += delivery.id
-            } catch (failure: V2Failure) { if (firstError == null) firstError = failure }
+            } catch (failure: V2Failure) {
+                observeDirectFailure(delivery, failure)
+                if (firstError == null) firstError = failure
+            }
         }
         for (batch in 0 until 100) {
             val response = commerceRequest("consumable-deliveries/pending", JsonObject()).body
@@ -1313,7 +1537,7 @@ internal class GoV2Client(
             var progress = false
             for (delivery in deliveries) {
                 discovered[delivery.id] = delivery
-                purchases[delivery.id] = delivery.purchase()
+                purchases[delivery.id] = observeDirectRecovery(delivery.purchase())
                 if (delivery.completed) {
                     completed += delivery.id; pending.remove(delivery.id); continue
                 }
@@ -1327,15 +1551,28 @@ internal class GoV2Client(
                     catch (_: Exception) { false }
                 }
                 if (granted) try {
-                    purchases[delivery.id] = confirmDirectDelivery(delivery.id)
+                    purchases[delivery.id] = observeDirectRecovery(confirmDirectDelivery(delivery.id))
                     pending.remove(delivery.id); completed += delivery.id; progress = true
-                } catch (failure: V2Failure) { if (firstError == null) firstError = failure }
+                } catch (failure: V2Failure) {
+                    observeDirectFailure(delivery, failure)
+                    if (firstError == null) firstError = failure
+                }
             }
             if (firstError != null || deliveries.size < 100 || !progress || fresh == 0) break
         }
         firstError?.let { throw it }
         return DirectReconciliation(InappifyConsumableSyncResult(discovered.size, completed.size, pending.values.toList()),
             purchases.values.toList())
+    }
+    private suspend fun observeDirectRecovery(purchase: InappifyPurchase): InappifyPurchase {
+        currentCoroutineContext()[RecoveryPass]?.record(RecoveredPurchase(purchase.attemptId,
+            purchase.productIdentifier, InappifyResult.Success(purchase, snapshot)))
+        return purchase
+    }
+    private suspend fun observeDirectFailure(delivery: GoV2DirectDelivery, failure: V2Failure) {
+        val purchase = delivery.purchase()
+        currentCoroutineContext()[RecoveryPass]?.record(RecoveredPurchase(purchase.attemptId,
+            purchase.productIdentifier, InappifyResult.Failure(failure.sdkError, snapshot)))
     }
     private suspend fun confirmDirectDelivery(deliveryId: Long): InappifyPurchase {
         requireSession()
@@ -1369,7 +1606,7 @@ internal class GoV2Client(
         saveDirectRecords(records)
         return delivered.purchase()
     }
-    override suspend fun syncPurchases(): InappifyResult<List<InappifyPurchase>> {
+    override suspend fun syncStorePurchases(): InappifyResult<List<InappifyPurchase>> {
         val result = run {
             requireSession()
             if (snapshot.storePlatform == "DirectAndroid") syncDirectConsumables().purchases
@@ -1438,34 +1675,187 @@ internal class GoV2Client(
             }
         })
     }
-    override suspend fun recover(): InappifyResult<Unit> = shared("recover") {
-        if (pendingLogout) return@shared logout()
+    internal suspend fun recover(): InappifyResult<Unit> {
+        check(!closed)
+        val work = recoveryCoordinator.request(automatic = false)
+        rememberReturnRecovery()
+        return work.await()
+    }
+
+    private suspend fun recoverOnce(automatic: Boolean): InappifyResult<Unit> {
+        InappifyLogger.log(InappifyLogLevel.DEBUG) { "Starting ${if (automatic) "automatic" else "internal"} recovery." }
+        if (pendingLogout) return recordRecoveryResult(logOut())
         if (pendingLogin) {
             val loginRecovery = run { resumeLogin() }
-            if (loginRecovery is InappifyResult.Failure) return@shared loginRecovery
+            if (loginRecovery is InappifyResult.Failure) return recordRecoveryResult(loginRecovery)
+            // This pass completed the pending transition itself; continue for its accepted identity.
+            return withContext(RecoveryPass(recoveryGeneration)) {
+                recordRecoveryResult(recoverConfiguredSession(automatic))
+            }
         }
+        return recordRecoveryResult(recoverConfiguredSession(automatic))
+    }
+
+    private suspend fun recordRecoveryResult(result: InappifyResult<Unit>): InappifyResult<Unit> {
+        val generation = currentCoroutineContext()[RecoveryPass]!!.generation
+        InappifyLogger.log(InappifyLogLevel.DEBUG) { "Recovery ${if (result is InappifyResult.Success) "completed" else "deferred after failure"}." }
+        // Serialize completion with event admission. An event either joins the still-active
+        // pass or sees its completed timestamp; it cannot launch a late duplicate between them.
+        mutex.withLock { recoveryRefreshPolicy.completed(generation, result is InappifyResult.Success) }
+        return result
+    }
+
+    private suspend fun recoverConfiguredSession(automatic: Boolean): InappifyResult<Unit> {
         val info = refreshCustomerInfo()
         if (nativeStoreMarket(snapshot.storePlatform) != null) {
             // Store recovery must not depend on catalog availability. A failed info refresh
             // also cannot turn stale cached entitlements into a reason to drop owned evidence.
             val sync = syncPendingConsumablesWithServerDedup(deduplicate = info is InappifyResult.Success)
-            val offerings = refreshOfferings()
-            if (info is InappifyResult.Failure) return@shared info
-            if (sync is InappifyResult.Failure) return@shared sync
-            if (offerings is InappifyResult.Failure) return@shared offerings
-            return@shared InappifyResult.Success(Unit, snapshot)
+            val offerings = if (automatic) refreshOfferingsIfNeeded() else refreshOfferings()
+            if (info is InappifyResult.Failure) return info
+            if (sync is InappifyResult.Failure) return sync
+            if (offerings is InappifyResult.Failure) return offerings
+            return InappifyResult.Success(Unit, snapshot)
         }
-        if (info is InappifyResult.Failure) return@shared info
-        val offerings = refreshOfferings()
-        if (offerings is InappifyResult.Failure) return@shared offerings
+        if (info is InappifyResult.Failure) return info
+        val offerings = if (automatic) refreshOfferingsIfNeeded() else refreshOfferings()
+        if (offerings is InappifyResult.Failure) return offerings
         if (snapshot.storePlatform == "DirectAndroid") {
             val sync = syncPendingConsumables()
-            if (sync is InappifyResult.Failure) return@shared sync
+            if (sync is InappifyResult.Failure) return sync
         }
-        InappifyResult.Success(Unit, snapshot)
+        return InappifyResult.Success(Unit, snapshot)
     }
-    override fun setNetworkEnabled(enabled: Boolean) { sdkApi.enabled = enabled; commerceApi?.enabled = enabled }
-    private fun scheduleRecovery() { if (backgroundRecovery) scope.launch { recover() } }
+    override fun setNetworkEnabled(enabled: Boolean) {
+        val reconnecting = enabled && !sdkApi.enabled
+        sdkApi.enabled = enabled
+        commerceApi?.enabled = enabled
+        if (reconnecting) scheduleRecoveryIfNeeded()
+        if (enabled) { scheduleOfferingsRefresh(); scheduleCustomerInfoRefresh() }
+    }
+    private fun scheduleRecovery() {
+        // Called while Configure/Login/Logout owns the state mutex. Startup still forces a
+        // pass, except while offline/disabled or inside this customer's error backoff.
+        if (canRecoverAutomatically() &&
+            recoveryRefreshPolicy.shouldRecover(recoveryGeneration, pending = false, startup = true))
+            recoveryCoordinator.request(automatic = true).also { rememberReturnRecovery() }
+        wakePaymentReturns()
+    }
+    private fun canRecoverAutomatically(): Boolean = backgroundRecovery && !closed && options != null &&
+        document.has("session") && sdkApi.enabled && commerceApi?.enabled != false && connectivityMonitor.isConnected
+
+    private fun scheduleRecoveryIfNeeded() {
+        wakePaymentReturns()
+        if (!backgroundRecovery || closed || recoveryCoordinator.isRunning()) return
+        scope.launch {
+            mutex.withLock {
+                if (!canRecoverAutomatically() || recoveryCoordinator.isRunning()) return@withLock
+                val pending = try { hasPendingRecovery() }
+                catch (cancelled: CancellationException) { throw cancelled }
+                catch (_: Exception) { true } // Let ordinary recovery report/check unreadable checkpoints.
+                if (recoveryRefreshPolicy.shouldRecover(recoveryGeneration, pending, startup = false))
+                    recoveryCoordinator.request(automatic = true).also { rememberReturnRecovery() }
+            }
+        }
+    }
+
+    // Read existing checkpoints only. Admission must not renew a session, query inventory,
+    // acknowledge delivery, or write a scheduling timestamp into encrypted storage.
+    private suspend fun hasPendingRecovery(): Boolean {
+        if (pendingLogin || pendingLogout) return true
+        if (snapshot.storePlatform == "DirectAndroid")
+            return directRecords().entrySet().any { (_, record) ->
+                record.asJsonObject.getAsJsonObject("delivery").string("status") != "COMPLETED"
+            }
+        val market = nativeStoreMarket(snapshot.storePlatform) ?: return false
+        val opt = options ?: return false
+        val session = document.getAsJsonObject("session") ?: return false
+        val recovery = storage.loadPendingStoreRecoveryState() ?: return true
+        return recovery.operations.any { it.store == market.storeId &&
+            it.apiKeyFingerprint == storeFingerprint(opt) &&
+            it.customerIdentifierFingerprint == digest(session.string("appUserId")) &&
+            it.appId == session.number("appId") && it.appIdentifier == metadata.get().packageIdentifier }
+    }
+
+    override fun handleDeepLink(url: String): Boolean {
+        if (closed) return false
+        val link = PaymentReturnLink.parse(url) ?: return false
+        if (verifiedScope?.appId?.let { it != link.appId } == true) return false
+        val preceding = recoveryCoordinator.active()
+        synchronized(paymentReturnLock) {
+            if (link in handledReturns) return true
+            if (!pendingReturns.containsKey(link)) {
+                if (pendingReturns.size == 32) pendingReturns.remove(pendingReturns.keys.first())
+                pendingReturns[link] = PendingReturn(link, preceding)
+            }
+        }
+        InappifyLogger.log(InappifyLogLevel.DEBUG) { "Accepted a marked payment return for recovery." }
+        wakePaymentReturns()
+        return true
+    }
+
+    private fun wakePaymentReturns() {
+        if (!closed && synchronized(paymentReturnLock) { pendingReturns.isNotEmpty() }) paymentReturnWakeups.trySend(Unit)
+    }
+
+    private fun rememberReturnRecovery() {
+        val flight = recoveryCoordinator.active() ?: return
+        synchronized(paymentReturnLock) {
+            pendingReturns.values.filter { it.preceding !== flight && it.following == null }
+                .forEach { it.following = flight }
+        }
+    }
+
+    private sealed interface ReturnStep {
+        class Wait(val recovery: RecoveryCoordinator.Flight) : ReturnStep
+        class Backoff(val millis: Long) : ReturnStep
+        class Sync(val links: List<PaymentReturnLink>, val generation: Long,
+            val work: Deferred<InappifyResult<Unit>>) : ReturnStep
+    }
+
+    private suspend fun recoverPaymentReturns() {
+        while (true) {
+            val step = mutex.withLock {
+                if (closed || !snapshot.isConfigured || pendingLogin || pendingLogout || !sdkApi.enabled ||
+                    commerceApi?.enabled == false || !connectivityMonitor.isConnected) return
+                val appId = document.getAsJsonObject("session")?.number("appId") ?: return
+                val batch = synchronized(paymentReturnLock) {
+                    pendingReturns.keys.filter { it.appId != appId }.forEach(pendingReturns::remove)
+                    pendingReturns.values.toList()
+                }
+                if (batch.isEmpty()) return
+                val active = recoveryCoordinator.active()
+                val following = batch.first().following?.takeIf { candidate ->
+                    candidate.pass.generation == recoveryGeneration && batch.all { it.following === candidate }
+                }
+                // A pass admitted before this return may already have read the old payment
+                // state. Finish it, then request fresh work; later startup work can be joined.
+                if (following != null) ReturnStep.Sync(batch.map { it.link }, recoveryGeneration, following.result)
+                else if (active != null && batch.any { it.preceding === active }) ReturnStep.Wait(active)
+                else if (active != null) ReturnStep.Sync(batch.map { it.link }, recoveryGeneration, active.result)
+                else {
+                    val retry = recoveryRefreshPolicy.retryDelayMillis(recoveryGeneration)
+                    if (retry > 0) ReturnStep.Backoff(retry)
+                    else ReturnStep.Sync(batch.map { it.link }, recoveryGeneration, recoveryCoordinator.request(automatic = true))
+                }
+            }
+            when (step) {
+                is ReturnStep.Wait -> step.recovery.result.await()
+                is ReturnStep.Backoff -> delay(step.millis)
+                is ReturnStep.Sync -> {
+                    val result = step.work.await()
+                    if (result is InappifyResult.Success) mutex.withLock {
+                        if (step.generation == recoveryGeneration) synchronized(paymentReturnLock) {
+                            step.links.forEach { link -> pendingReturns.remove(link); handledReturns += link }
+                            while (handledReturns.size > 128) handledReturns.remove(handledReturns.first())
+                        }
+                    }
+                    else synchronized(paymentReturnLock) { step.links.forEach { pendingReturns[it]?.following = null } }
+                    return // Failures remain pending; another event may retry after backoff.
+                }
+            }
+        }
+    }
     override fun addEventListener(listener: InappifyEventListener): InappifyListenerRegistration {
         check(!closed); listeners.add(listener)
         return InappifyListenerRegistration.create(Runnable { listeners.remove(listener) })
@@ -1489,6 +1879,10 @@ internal class GoV2Client(
         }
         resources.first.forEach { it.cancel(CancellationException("The Inappify client is closed.")) }
         resources.second.forEach { runCatching { it.close() } }
+        foregroundMonitor.close()
+        connectivityMonitor.close()
+        paymentLinkMonitor.close()
+        paymentReturnWakeups.close()
         scope.cancel(); sdkApi.close(); commerceApi?.close(); listeners.clear(); deliveryHandler = null
     }
     private fun requireSession() {
@@ -1516,6 +1910,11 @@ internal class GoV2Client(
         pendingLogin = document.has("pendingLogin")
         val rawOfferings = document.getAsJsonObject("offerings")
         val identity = session?.string("appUserId")
+        if ((rawOfferings == null && snapshot.offerings != null) ||
+            snapshot.appUserIdentifier != identity ||
+            snapshot.country != normalizeCountry(document.get("country")?.asString ?: "IR") ||
+            snapshot.appVersion != (document.get("appVersion")?.asString ?: metadata.get().versionName))
+            offeringsRefreshPolicy.invalidate()
         val info = if (identity != null && !pendingLogout && !pendingLogin) verifier.verifyWithScope(
             document.getAsJsonObject("info") ?: session, identity, boundScope(), allowExpiredCache = true,
             expectedSubject = boundSubject()).info else null
@@ -1526,20 +1925,37 @@ internal class GoV2Client(
         }
         val before = snapshot
         authenticatedScope = boundScope().takeIf { session != null && !pendingLogout && !pendingLogin }
-        currentSnapshot = InappifySnapshot(
+        val nextSnapshot = InappifySnapshot(
             before.revision + 1, session != null && !pendingLogout && !pendingLogin,
             identity != null && !isAnonymous(identity) && !pendingLogout && !pendingLogin,
-            if (pendingLogout || pendingLogin) null else identity, options?.market,
-            normalizeCountry(document.get("country")?.asString ?: options?.country ?: "IR"),
-            document.get("appVersion")?.asString ?: options?.appVersion ?: metadata.get().versionName, BuildConfig.SDK_VERSION,
-            session?.get("storeInfo")?.takeUnless { it.isJsonNull }?.asString, null, boundScope()?.appId,
-            info?.let { InappifyDomainJsonCodec.parseCustomerInfo(it.toString()) },
+            if (pendingLogout || pendingLogin) null else identity, null,
+            normalizeCountry(document.get("country")?.asString ?: "IR"),
+            document.get("appVersion")?.asString ?: metadata.get().versionName, BuildConfig.SDK_VERSION,
+            session?.get("storeInfo")?.takeUnless { it.isJsonNull }?.asString, boundScope()?.appId,
+            info?.let { InappifyDomainJsonCodec.parseCustomerInfo(it.toString()).withEntitlementClock(::trustedNow) },
             if (pendingLogout || pendingLogin) null else rawOfferings?.let { InappifyDomainJsonCodec.parseOfferings(it.toString()) },
             false, false, session?.number("storePlatform")?.let { platform ->
                 mapOf(1L to "DirectIos", 2L to "DirectAndroid", 3L to "DirectWeb", 5L to "PlayStore",
                     6L to "AppStore", 10L to "Bazar", 11L to "MyKet", 12L to "SibApp")[platform] ?: platform.toString()
             },
         )
+        // Pending barriers hide UI state but do not replace the accepted session binding.
+        // A rejected Login must not supersede recovery for the still-current customer.
+        val subject = boundSubject()
+        if (recoveryIdentity != identity || recoverySubject != subject) {
+            recoveryIdentity = identity
+            recoverySubject = subject
+            recoveryGeneration++
+            recoveryRefreshPolicy.reset(recoveryGeneration)
+        }
+        currentSnapshot = nextSnapshot
+        InappifyLogger.log(InappifyLogLevel.VERBOSE) { "SDK state revision ${nextSnapshot.revision} published." }
+        if (before.appUserIdentifier != nextSnapshot.appUserIdentifier)
+            InappifyLogger.log(InappifyLogLevel.INFO) { "Customer identity changed." }
+        if (before.customerInfo != nextSnapshot.customerInfo)
+            InappifyLogger.log(InappifyLogLevel.DEBUG) { "CustomerInfo snapshot updated." }
+        if (before.offerings != nextSnapshot.offerings)
+            InappifyLogger.log(InappifyLogLevel.DEBUG) { "Offerings snapshot updated." }
         val published = snapshot
         val types = buildList {
             add(InappifyEventType.STATE_CHANGED)
@@ -1557,8 +1973,7 @@ internal class GoV2Client(
         val app = metadata.get()
         if (value.apiKey.isBlank() || value.apiKey.length > 4096 || value.apiKey.any(Char::isISOControl) ||
             app.packageIdentifier.isBlank() || app.packageIdentifier.length > 255 ||
-            (value.country != null && !validCountry(value.country)) ||
-            (value.appVersion ?: app.versionName).let { it.isBlank() || it.length > 50 } || app.versionCode < 1 ||
+            app.versionName.let { it.isBlank() || it.length > 50 } || app.versionCode < 1 ||
             (value.appUserIdentifier != null && !validIdentity(value.appUserIdentifier))) fail("CONFIGURATION", "INVALID_OPTIONS")
     }
     private fun fingerprint(value: InappifyOptions): String {
@@ -1585,6 +2000,7 @@ internal class GoV2Client(
         internal fun create(context: Context, configuration: InappifyV2Configuration): GoV2Client =
             create(context, GoV2Environment.explicit(configuration))
         private fun create(context: Context, configuration: GoV2Environment, unsafeRawHttpLogging: Boolean = false): GoV2Client {
+            InappifyLogger.initializeDefault(context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0)
             val client = OkHttpClient.Builder().followRedirects(false).followSslRedirects(false)
                 .connectTimeout(15, TimeUnit.SECONDS).readTimeout(30, TimeUnit.SECONDS)
                 .writeTimeout(30, TimeUnit.SECONDS).callTimeout(45, TimeUnit.SECONDS)
@@ -1593,7 +2009,10 @@ internal class GoV2Client(
                 EncryptedSessionStateStore.createGoV2(context), AndroidAppMetadataProvider(context),
                 commerceApi = GoApi(OkHttpTransport.create(configuration.commerceApiBaseUrl.toHttpUrl(),
                     client.newBuilder().build(), unsafeRawHttpLogging), System::currentTimeMillis),
-                billingFactory = AndroidStoreBillingAdapterFactory(context))
+                billingFactory = AndroidStoreBillingAdapterFactory(context),
+                foregroundMonitor = AndroidAppForegroundMonitor(),
+                connectivityMonitor = AndroidNetworkConnectivityMonitor(context),
+                paymentLinkMonitor = AndroidPaymentLinkMonitor(context))
         }
     }
 }
@@ -1618,7 +2037,7 @@ internal fun validIdentity(value: String): Boolean {
 }
 internal fun validCountry(value: String): Boolean = value.trim().matches(Regex("[A-Za-z]{2}"))
 internal fun normalizeCountry(value: String): String = value.trim().uppercase(Locale.ROOT)
-internal val reservedKeys = setOf("\$email", "\$displayName", "\$apnsTokens", "\$fcmTokens", "\$idfa", "\$idfv", "\$phoneNumber", "\$campaign", "\$keyword")
+internal val reservedKeys = setOf("\$email", "\$displayName", "\$apnsTokens", "\$fcmTokens", "\$idfa", "\$idfv", "\$ip", "\$phoneNumber", "\$campaign", "\$keyword")
 internal fun validAttribute(key: String, value: String?): Boolean =
     (key in reservedKeys || key.matches(Regex("[A-Za-z][A-Za-z0-9_-]{0,39}"))) &&
         (value == null || value.codePointCount(0, value.length) <= 500)

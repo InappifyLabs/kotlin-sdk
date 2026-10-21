@@ -1,6 +1,5 @@
 package com.inappify.sdk
 
-import android.app.Activity
 import android.content.Context
 import com.inappify.sdk.internal.v2.GoV2Client
 
@@ -17,6 +16,18 @@ import com.inappify.sdk.internal.v2.GoV2Client
 public interface InappifyClient : AutoCloseable {
 
     public companion object {
+
+        /** Global minimum severity. Defaults to DEBUG for development and INFO for release. */
+        @JvmStatic
+        public var logLevel: InappifyLogLevel
+            get() = InappifyLoggingSettings.level
+            set(value) { InappifyLoggingSettings.level = value }
+
+        /** Replaces the default Logcat handler. May be set before Configure. */
+        @JvmStatic
+        public var logHandler: InappifyLogHandler
+            get() = InappifyLoggingSettings.handler
+            set(value) { InappifyLoggingSettings.handler = value }
 
         /**
          * Creates an independent client backed by the production Inappify
@@ -38,66 +49,56 @@ public interface InappifyClient : AutoCloseable {
     /** Configures the session for the application represented by [options]. */
     public suspend fun configure(options: InappifyOptions): InappifyResult<Unit>
 
-    /** Changes the customer identity owned by this session. */
-    public suspend fun login(request: InappifyLoginRequest): InappifyResult<Unit>
+    /** Changes customer identity using the existing session, cache and retry flow. */
+    public suspend fun logIn(appUserIdentifier: String): InappifyResult<Unit>
 
-    /** Clears the authenticated customer and returns the resulting state. */
-    public suspend fun logout(): InappifyResult<Unit>
+    /** Logs out using the existing durable transition, anonymous session and cache flow. */
+    public suspend fun logOut(): InappifyResult<Unit>
 
     /**
-     * Returns the current customer information.
-     *
-     * [forceRefresh] defaults to true and selects NETWORK_ONLY. Pass false
-     * for CACHE_FIRST: valid session-bound cache may return immediately while
-     * a background refresh is scheduled.
+     * Returns verified customer information using [fetchPolicy]. The default returns
+     * cache immediately and refreshes it when stale (five minutes in the foreground,
+     * twenty-five hours in the background). No periodic timer is started.
      */
     public suspend fun getCustomerInfo(
-        forceRefresh: Boolean = true,
+        fetchPolicy: InappifyCacheFetchPolicy = InappifyCacheFetchPolicy.CACHED_OR_FETCHED,
     ): InappifyResult<InappifyCustomerInfo>
-
-    /** Fetches the current customer information from the Inappify service. */
-    public suspend fun refreshCustomerInfo(): InappifyResult<InappifyCustomerInfo>
 
     /**
      * Returns the offerings for the active session, reusing the session-bound
-     * cache when it is available.
+     * cache when it is available. Cached reads only schedule an automatic refresh
+     * when the app is in the foreground and the five-minute freshness window
+     * has elapsed. Automatic failures have a thirty-second retry backoff.
      */
     public suspend fun getOfferings(): InappifyResult<InappifyOfferings>
 
-    /** Fetches offerings for the active session from the Inappify service. */
-    public suspend fun refreshOfferings(): InappifyResult<InappifyOfferings>
+    /** Selects an exact offering from the normal session-bound cache/fetch flow. */
+    public suspend fun getOffering(identifier: String): InappifyResult<InappifyOffering?> =
+        when (val result = getOfferings()) {
+            is InappifyResult.Success -> InappifyResult.Success(result.data.getOffering(identifier), result.snapshot)
+            is InappifyResult.Failure -> result
+        }
 
     /**
-     * Validates one discount code for the active customer.
-     *
-     * [InappifyDiscountCodeRequest.offeringIdentifier] is accepted for API
-     * consistency but is not sent by the current endpoint. Validation uses the
-     * active session.
+     * Checks [discountCode] for the active customer and returns eligible web
+     * payment links. An invalid code is a successful result with isValid=false.
+     * Network/server errors are failures. Does not apply a discount to purchases
+     * or change cached offerings.
      */
-    public suspend fun validateDiscountCode(
-        request: InappifyDiscountCodeRequest,
+    public suspend fun getDiscountedPaymentLinks(
+        discountCode: String,
     ): InappifyResult<InappifyDiscountCodeResult>
-
-    /**
-     * Updates the local targeting values and invalidates cached offerings.
-     * A null value leaves the corresponding field unchanged.
-     */
-    public suspend fun setTargetingContext(
-        country: String? = null,
-        appVersion: String? = null,
-    ): InappifyResult<Unit>
 
     /**
      * Returns the server-selected offering: a placement selection, then the
      * current offering, then the default offering. The production client does
-     * not evaluate targeting rules locally and ignores [context].
-     * [forceRefresh] refreshes offerings before selection. A successful result
-     * can contain null when the server supplies no matching selection.
+     * not evaluate targeting rules locally.
+     * Uses the same cache/fetch policy as [getOfferings]. For a manual refresh,
+     * await [syncAttributesAndOfferingsIfNeeded] before selecting an offering.
+     * A successful result can contain null when the server supplies no matching selection.
      */
     public suspend fun getCurrentOffering(
         placementIdentifier: String? = null,
-        forceRefresh: Boolean = false,
-        context: InappifyOfferingEvaluationContext? = null,
     ): InappifyResult<InappifyOffering?>
 
     /** Returns whether the latest snapshot contains the named active entitlement. */
@@ -117,44 +118,17 @@ public interface InappifyClient : AutoCloseable {
         com.inappify.sdk.isCustomerAnonymous(appUserIdentifier)
 
     /**
-     * Checks whether [identifier] is active. Customer information is refreshed
-     * first by default.
+     * Sets attributes through the existing validation, durable queue and sync flow.
+     * Null or empty values delete a key. The public Go API remains write-only.
      */
-    public suspend fun checkEntitlement(
-        identifier: String,
-        forceRefresh: Boolean = true,
-    ): InappifyResult<Boolean>
-
-    /** Validates and durably queues custom attributes; invalid entries fail the request. */
     public suspend fun setAttributes(
-        request: InappifyAttributesRequest,
-    ): InappifyResult<List<InappifyAttribute>>
-
-    /** Map-style convenience overload for [setAttributes]. */
-    public suspend fun updateAttributes(
-        values: Map<String, String?>,
-    ): InappifyResult<List<InappifyAttribute>> = setAttributes(
-        InappifyAttributesRequest(
-            values.entries.map { entry ->
-                InappifyAttribute(key = entry.key, value = entry.value)
-            },
-        ),
-    )
-
-    /** Deletes custom attributes by key. */
-    public suspend fun deleteAttributes(
-        request: InappifyDeleteAttributesRequest,
+        attributes: Map<String, String?>,
     ): InappifyResult<List<InappifyAttribute>>
 
     /** Stores one reserved customer attribute. */
     public suspend fun setReservedAttribute(
         request: InappifyReservedAttributeRequest,
     ): InappifyResult<Unit>
-
-    /** Queues supplied attribute changes, then flushes pending writes; does not download attributes. */
-    public suspend fun syncAttributes(
-        request: InappifyAttributesRequest? = null,
-    ): InappifyResult<List<InappifyAttribute>>
 
     /** Returns whether a reserved attribute key can be written. */
     public suspend fun canSetReservedAttribute(key: String): InappifyResult<Boolean>
@@ -170,14 +144,6 @@ public interface InappifyClient : AutoCloseable {
         setReservedAttribute(
             InappifyReservedAttributeRequest(InappifyReservedAttribute.APNS_TOKEN, apnsToken),
         )
-
-    /** Deprecated spelling retained for source compatibility. */
-    @Deprecated(
-        message = "Use setDisplayName.",
-        replaceWith = ReplaceWith("setDisplayName(displayName)"),
-    )
-    public suspend fun setDisplayname(displayName: String): InappifyResult<Unit> =
-        setDisplayName(displayName)
 
     /** Convenience wrapper for the reserved `$displayName` attribute. */
     public suspend fun setDisplayName(displayName: String): InappifyResult<Unit> =
@@ -234,34 +200,15 @@ public interface InappifyClient : AutoCloseable {
         )
 
     /**
-     * Purchases one product through the configured app route.
+     * Purchases a catalog package through the existing configured purchase route.
      *
-     * Both factories use the verified V2 session's server route. Unsupported,
-     * missing or conflicting marketplace selection fails explicitly.
-     *
-     * Direct and trial flows do not need marketplace UI. A new non-trial
-     * Bazaar or Myket purchase requires the Activity overload. Caller-supplied
-     * lost-purchase credentials are rejected; use [syncPurchases] or
-     * [restorePurchases] to reconcile verified store evidence.
+     * The package supplies its parent offering and product metadata. A native
+     * store purchase requires known server product classification; old or
+     * incomplete catalogs must be refreshed before starting a native purchase.
+     * Direct checkout keeps its existing NEEDTOPAY/URL behavior.
      */
     public suspend fun purchase(
-        request: InappifyPurchaseRequest,
-    ): InappifyResult<InappifyPurchase>
-
-    /**
-     * Purchases one product through the configured app route.
-     *
-     * Both factories use the verified V2 session's server route. Unsupported,
-     * missing or conflicting marketplace selection fails explicitly.
-     *
-     * [activity] must be the current foreground activity and must implement
-     * AndroidX `ActivityResultRegistryOwner` and `LifecycleOwner`. It is used
-     * only to launch the marketplace UI and is never retained after the
-     * operation finishes.
-     */
-    public suspend fun purchase(
-        activity: Activity,
-        request: InappifyPurchaseRequest,
+        purchaseParams: InappifyPurchaseParams,
     ): InappifyResult<InappifyPurchase>
 
     /**
@@ -274,7 +221,7 @@ public interface InappifyClient : AutoCloseable {
      * use the dedicated server-linkage recovery endpoint. Raw store evidence
      * is never returned to the application.
      */
-    public suspend fun syncPurchases(): InappifyResult<List<InappifyPurchase>>
+    public suspend fun syncStorePurchases(): InappifyResult<List<InappifyPurchase>>
 
     /**
      * Registers an observer for authoritative state changes from this client.
@@ -287,7 +234,7 @@ public interface InappifyClient : AutoCloseable {
     /**
      * Releases resources owned by this client.
      *
-     * Closing a client is not equivalent to [logout] and must not perform a
+     * Closing a client is not equivalent to [logOut] and must not perform a
      * remote logout implicitly.
      */
     public override fun close(): Unit

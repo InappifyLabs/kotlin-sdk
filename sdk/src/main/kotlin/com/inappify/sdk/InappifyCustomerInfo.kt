@@ -12,8 +12,17 @@ public class InappifyCustomerInfo public constructor(
     attributes: List<InappifyAttribute>? = null,
 ) {
 
-    /** Defensive, unmodifiable copy of the customer's entitlements. */
-    public val entitlements: List<InappifyEntitlement>? = immutableList(entitlements)
+    // Keep null versus an empty list in the existing wire/cache codec.
+    internal val entitlementList: List<InappifyEntitlement>? = immutableList(entitlements)
+    private var entitlementClock: () -> Long = System::currentTimeMillis
+
+    /** Known and active rights, indexed by identifier. Also supports existing list operations. */
+    public val entitlements: InappifyEntitlementInfos =
+        InappifyEntitlementInfos(entitlementList.orEmpty()) { entitlementClock() }
+
+    internal fun withEntitlementClock(now: () -> Long): InappifyCustomerInfo = apply {
+        entitlementClock = now
+    }
 
     /** Defensive, unmodifiable copy of the customer's transactions. */
     public val transactions: List<InappifyTransaction>? = immutableList(transactions)
@@ -41,7 +50,7 @@ public class InappifyCustomerInfo public constructor(
             requestDate == other.requestDate &&
             latestExpirationDate == other.latestExpirationDate &&
             hasUsedTrial == other.hasUsedTrial &&
-            entitlements == other.entitlements &&
+            entitlementList == other.entitlementList &&
             transactions == other.transactions &&
             attributes == other.attributes
 
@@ -51,7 +60,7 @@ public class InappifyCustomerInfo public constructor(
         result = 31 * result + (requestDate?.hashCode() ?: 0)
         result = 31 * result + (latestExpirationDate?.hashCode() ?: 0)
         result = 31 * result + (hasUsedTrial?.hashCode() ?: 0)
-        result = 31 * result + (entitlements?.hashCode() ?: 0)
+        result = 31 * result + (entitlementList?.hashCode() ?: 0)
         result = 31 * result + (transactions?.hashCode() ?: 0)
         result = 31 * result + (attributes?.hashCode() ?: 0)
         return result

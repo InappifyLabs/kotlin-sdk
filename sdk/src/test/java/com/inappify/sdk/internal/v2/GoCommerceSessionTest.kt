@@ -74,7 +74,7 @@ class GoCommerceSessionTest {
             commerce.requests.forEach {
                 assertEquals("Bearer session-initial", it.headers["Authorization"])
                 assertEquals("application/json", it.headers["Accept"])
-                assertTrue(jsonObject(it.jsonBody).keySet().all { field -> field in setOf("productIdentifier", "offeringIdentifier", "isCrypto", "paywallId", "paywallRevision") })
+                assertTrue(jsonObject(it.jsonBody).keySet().all { field -> field in setOf("productIdentifier", "offeringIdentifier", "paymentReturnVersion", "paywallId", "paywallRevision") })
             }
         }
     }
@@ -156,7 +156,7 @@ class GoCommerceSessionTest {
     @Test fun persistedPendingDoesNotCrossIdentityOrCommerceEndpoint() = runBlocking {
         client().use { sdk ->
             configure(sdk); sdk.syncPendingConsumables()
-            assertTrue(sdk.login(InappifyLoginRequest("customer-other")) is InappifyResult.Success)
+            assertTrue(sdk.logIn("customer-other") is InappifyResult.Success)
             assertTrue(sdk.confirmDelivery(7) is InappifyResult.Failure)
             assertFalse(commerce.requests.any { it.path.endsWith("/delivered") })
         }
@@ -176,9 +176,9 @@ class GoCommerceSessionTest {
             expired = false; now += 2000; token = "session-refreshed"
             pending = false
             assertTrue(sdk.syncPendingConsumables() is InappifyResult.Success)
-            assertTrue(sdk.login(InappifyLoginRequest("customer-second")) is InappifyResult.Success)
+            assertTrue(sdk.logIn("customer-second") is InappifyResult.Success)
             assertTrue(sdk.syncPendingConsumables() is InappifyResult.Success)
-            assertTrue(sdk.logout() is InappifyResult.Success)
+            assertTrue(sdk.logOut() is InappifyResult.Success)
             assertTrue(sdk.syncPendingConsumables() is InappifyResult.Success)
             assertEquals(listOf("Bearer session-refreshed", "Bearer session-login", "Bearer session-logout"), commerce.requests.map { it.headers["Authorization"] })
         }

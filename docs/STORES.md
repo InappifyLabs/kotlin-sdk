@@ -2,11 +2,11 @@
 
 The SDK provides Android billing adapters for Cafe Bazaar and Myket. A store receipt is evidence for server verification; it does not grant an entitlement by itself. The configured session's `storePlatform` selects the purchase route.
 
-| Session store platform | Configure market | Products supported by this SDK | Owned inventory queried |
-| --- | --- | --- | --- |
-| `Bazar` | `InappifyMarket.BAZAAR` | Consumable, non-consumable, subscription | Bazaar subscriptions, then in-app purchases |
-| `MyKet` | `InappifyMarket.MYKET` | Consumable, non-consumable | Myket in-app purchases |
-| `DirectAndroid` | `InappifyMarket.NONE` | Server checkout; no native store UI | Server delivery queue |
+| Session store platform | Products supported by this SDK | Owned inventory queried |
+| --- | --- | --- |
+| `Bazar` | Consumable, non-consumable, subscription | Bazaar subscriptions, then in-app purchases |
+| `MyKet` | Consumable, non-consumable | Myket in-app purchases |
+| `DirectAndroid` | Server checkout; no native store UI | Server delivery queue |
 
 These native adapters run on Android. They do not implement iOS billing, Google Play Billing, or App Store billing. Myket subscriptions are unsupported by this SDK and are rejected before launching billing.
 
@@ -19,9 +19,9 @@ Before testing a store build:
 1. Register the Android application and its product identifiers in the chosen store, and use the application package and signing identity associated with that registration.
 2. Configure the corresponding application, offering, package, and product in Inappify. `productIdentifier` must identify the store SKU; `packageIdentifier` identifies the Inappify package selected from Offerings.
 3. Install the chosen store application on the device and sign in to an account eligible to buy or query the products. A missing store application, unavailable billing service, or account that cannot return inventory produces a store error.
-4. Obtain the application's Base64 RSA public billing key from the chosen store and supply it as `marketKey`, or arrange for the configured session to return the appropriate key in `storeInfo`.
+4. Save the application's Base64 RSA public billing key from the chosen store in Inappify. Configure returns it as `storeInfo`, and the SDK persists it with the session for billing and recovery.
 
-The Inappify `apiKey` initializes the session. The store's RSA public `marketKey` verifies billing receipts locally. They are different inputs. Never supply a private RSA key, account password, or manually acquired store purchase token as configuration.
+The Inappify `apiKey` initializes the session. The server supplies the store RSA public key for local receipt verification; the app does not pass it to Configure. Never supply a private RSA key, account password, or manually acquired store purchase token as configuration.
 
 ## Manifest merging
 
@@ -45,7 +45,6 @@ These billing permissions are manifest permissions, not runtime permission dialo
 Create a long-lived client with `InappifyClient.create(applicationContext)`, then configure it after determining the current app-user identity:
 
 ```kotlin
-import com.inappify.sdk.InappifyMarket
 import com.inappify.sdk.InappifyOptions
 import com.inappify.sdk.InappifyResult
 import com.inappify.sdk.InappifyV2Client
@@ -54,34 +53,32 @@ suspend fun configureBazaarStore(
     client: InappifyV2Client,
     inappifyApiKey: String,
     currentAppUserId: String?,
-    bazaarRsaPublicKey: String,
 ): InappifyResult<Unit> = client.configure(
     InappifyOptions(
         apiKey = inappifyApiKey,
         appUserIdentifier = currentAppUserId,
-        market = InappifyMarket.BAZAAR,
-        marketKey = bazaarRsaPublicKey,
     ),
 )
 ```
 
-For Myket, use `InappifyMarket.MYKET` and that application's Myket RSA key. A nonblank configured `marketKey` takes priority over the session's `storeInfo` value. Do not pair one store's RSA key with another store's route.
+Both Bazaar and Myket obtain their route and RSA public key from the server session. Configure only accepts the app API key and optional customer identity.
 
-`market` is not sent as a route override in the Configure request. The server returns `storePlatform` for the configured application. Confirm that `client.snapshot.storePlatform` is `Bazar` or `MyKet` as intended. A request-level market cannot switch a server-bound purchase to another store; a Myket configuration/route conflict also fails with `MARKET_KEY_ROUTE_MISMATCH`.
+No market override is accepted by Configure. The server returns `storePlatform` for the configured application. Confirm that `client.snapshot.storePlatform` is `Bazar` or `MyKet` as intended. A request-level market cannot switch a server-bound purchase to another store.
 
 Configure may return after reusing a valid cached session. Its automatic recovery work continues in the background. Wait for an Offerings result or event before constructing a purchase from the current catalog. See [recovery and cache](RECOVERY_AND_CACHE.md) for startup behavior and explicit reconciliation.
 
 ## Host the purchase UI in an Activity
 
-A new paid store purchase requires `client.purchase(activity, request)`. The Activity must implement both AndroidX `ActivityResultRegistryOwner` and `LifecycleOwner`, and must not be finishing or destroyed. `ComponentActivity`, `FragmentActivity`, and `AppCompatActivity` satisfy the interface requirements.
+A new paid store purchase requires `client.purchase(InappifyPurchaseParams.Builder(activity, selectedPackage).build())`. The Activity must implement both AndroidX `ActivityResultRegistryOwner` and `LifecycleOwner`, and must not be finishing or destroyed. `ComponentActivity`, `FragmentActivity`, and `AppCompatActivity` satisfy the interface requirements.
 
 Use the visible checkout Activity for each invocation. Passing an application context or calling the overload without an Activity cannot start a new store purchase. The SDK keeps an invocation-scoped weak Activity reference, registers lifecycle-bound result handling, and cancels the operation if that host is destroyed. Store inventory queries and durable verification recovery do not need an Activity.
 
 Both adapters perform their billing setup/UI calls on the Android main thread; the public API is suspending. Coroutine cancellation propagates to the caller, and adapter cleanup disconnects or disposes billing resources. Closing the client cancels its work and billing adapters. Recreate a client after `close()`; do not close it after every checkout.
 
-## Purchase with an explicit product type
+## Purchase a catalog package
 
-Use identifiers from the current Inappify Offerings and specify the product type:
+Use the Package returned by the selected Offering. The SDK reads the product
+type supplied by Go V2 and adapts to the existing store purchase request:
 
 ```kotlin
 import android.app.Activity
@@ -90,28 +87,30 @@ import com.inappify.sdk.*
 suspend fun buyStoreSubscription(
     client: InappifyV2Client,
     activity: Activity,
-    selectedOffering: InappifyOffering,
     selectedPackage: InappifyPackage,
     logicalPurchaseAttemptId: String,
 ): InappifyResult<InappifyPurchase> = client.purchase(
-    activity = activity,
-    request = InappifyPurchaseRequest(
-        productIdentifier = requireNotNull(selectedPackage.product?.identifier),
-        offeringIdentifier = requireNotNull(selectedOffering.identifier),
-        packageIdentifier = requireNotNull(selectedPackage.identifier),
-        idempotencyKey = logicalPurchaseAttemptId,
-        productType = InappifyProductType.SUBSCRIPTION,
-    ),
+    InappifyPurchaseParams.Builder(activity, selectedPackage)
+        .idempotencyKey(logicalPurchaseAttemptId)
+        .build(),
 )
 ```
 
 | `InappifyProductType` | Bazaar billing call | Myket billing call | Fulfillment |
-| --- | --- | --- | --- |
+| --- | --- | --- |
 | `CONSUMABLE` | `purchaseProduct` / `IN_APP` | In-app purchase | Verified host delivery, acknowledgement, then consumption |
 | `NON_CONSUMABLE` | `purchaseProduct` / `IN_APP` | In-app purchase | Server-confirmed ownership; no consumption |
 | `SUBSCRIPTION` | `subscribeProduct` / `SUBSCRIPTION` | Unsupported | Server-confirmed entitlement; no consumption |
 
-An omitted product type uses in-app billing and leaves consumable classification to a valid server response. It does not request subscription billing. Explicit product types make the intended flow clear and are required for starting a subscription purchase.
+The package-based API requires a known `product.productType` for native stores.
+Missing or unknown metadata returns `PRODUCT_TYPE_REQUIRED` before opening the
+store; refresh offerings and ensure the product is classified in the catalog. An
+unbound package has no parent offering and returns
+`PURCHASE_PACKAGE_CONTEXT_REQUIRED`. No product or offering is guessed from
+another catalog entry. Parent context is reconstructed after cache restoration.
+
+The public purchase API accepts `InappifyPurchaseParams` only. Product, Offering,
+Package and classification come from the selected catalog package.
 
 If supplied, `idempotencyKey` must match `[A-Za-z0-9_.:-]{1,128}`. Generate one value per logical purchase and retain it while that attempt is unresolved. If the corresponding encrypted checkpoint exists, retrying the same request and key resumes server verification without opening billing again. Reusing a key with a different product, offering, type, customer, app, or store fails with `PURCHASE_ATTEMPT_CONFLICT`. The host must not interpret a timeout or missing callback as permission to create another paid attempt.
 
@@ -131,7 +130,7 @@ Useful failure details include `store`, `storeCode`, `attemptId`, `httpStatus`, 
 
 Grant a verified consumable exactly once in host-owned durable storage using `deliveryId` as the unique grant key. After that transaction commits, call `client.confirmDelivery(deliveryId)`, or register an `InappifyConsumableDeliveryHandler` that returns `DELIVERED` only after the same durable grant. Returning `RETRY_LATER` or throwing keeps the delivery pending. The SDK acknowledges the grant, consumes the store receipt, and reports consumption to Inappify. It does not infer credit amounts or grant the item for the host.
 
-`client.restorePurchases()` returns independent restored/already-processed/failed counts and attempts to reconcile subscriptions and known non-consumables. It does not treat owned consumable inventory as a new restore grant. Pending paid operations can still finish their existing verification and delivery checkpoints. `syncPurchases()` and `recover()` handle interrupted purchases, including consumables. Their behavior and duplicate checks are described in [recovery and cache](RECOVERY_AND_CACHE.md).
+`client.restoreStorePurchases()` returns independent restored/already-processed/failed counts and attempts to reconcile subscriptions and known non-consumables. It does not treat owned consumable inventory as a new restore grant. Pending paid operations can still finish their existing verification and delivery checkpoints. `syncStorePurchases()` and internal automatic recovery handle interrupted purchases, including consumables. Their behavior and duplicate checks are described in [recovery and cache](RECOVERY_AND_CACHE.md).
 
 ## Device and inventory limits
 

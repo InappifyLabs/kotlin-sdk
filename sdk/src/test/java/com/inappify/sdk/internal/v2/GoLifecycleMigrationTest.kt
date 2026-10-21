@@ -16,8 +16,9 @@ class GoLifecycleMigrationTest {
     private val store = MemoryV2Store()
     private val transport = V2Transport()
     private val options = InappifyOptions("public-key", signing.subject)
+    private var installedVersion = "2.4.0"
     private fun client() = GoV2Client(signing.config, GoApi(transport, { signing.now }, {}), store,
-        AppMetadataProvider { AppMetadata("com.example.mobile", "2.4.0", 20400) },
+        AppMetadataProvider { AppMetadata("com.example.mobile", installedVersion, 20400) },
         { signing.now }, Dispatchers.Unconfined, backgroundRecovery = false)
 
     private suspend fun seedOldPendingLogout() {
@@ -116,9 +117,9 @@ class GoLifecycleMigrationTest {
             assertTrue(sdk.configure(options) is InappifyResult.Success)
             val before = sdk.snapshot
             sdk.setNetworkEnabled(false)
-            assertTrue(sdk.login(InappifyLoginRequest("new-user")) is InappifyResult.Failure)
+            assertTrue(sdk.logIn("new-user") is InappifyResult.Failure)
             assertEquals(before, sdk.snapshot)
-            assertTrue(sdk.logout() is InappifyResult.Failure)
+            assertTrue(sdk.logOut() is InappifyResult.Failure)
             assertEquals(before, sdk.snapshot)
             assertFalse(sdk.isLogoutPending)
             assertFalse(jsonObject(store.value!!.customerInfoJson!!).has("pendingLogin"))
@@ -172,7 +173,8 @@ class GoLifecycleMigrationTest {
             assertNotNull(sdk.snapshot.offerings)
             transport.requests.clear()
             transport.handler = { TransportResult.Failure(TransportFailureKind.NETWORK) }
-            val changed = InappifyOptions("public-key", signing.subject, country = "TR", appVersion = "3.0.0")
+            installedVersion = "3.0.0"
+            val changed = InappifyOptions("public-key", signing.subject)
             assertTrue(sdk.configure(changed) is InappifyResult.Failure)
             assertEquals(customer, sdk.snapshot.customerInfo)
             assertNull(sdk.snapshot.offerings)
@@ -185,7 +187,7 @@ class GoLifecycleMigrationTest {
             assertTrue(sdk.configure(changed) is InappifyResult.Failure)
             assertFalse(transport.requests.isEmpty())
             assertTrue(transport.requests.all {
-                it.path == "configure" && jsonObject(it.jsonBody).string("country") == "TR" &&
+                it.path == "configure" && jsonObject(it.jsonBody).string("country") == "IR" &&
                     jsonObject(it.jsonBody).string("versionName") == "3.0.0"
             })
         }

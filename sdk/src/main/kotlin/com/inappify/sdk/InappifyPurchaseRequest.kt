@@ -1,7 +1,7 @@
 package com.inappify.sdk
 
 /**
- * Immutable request for one purchase under the configured, verified session.
+ * Internal purchase command under the configured, verified session.
  *
  * The server's storePlatform selects checkout. [market] cannot override that
  * route. Use the explicit [productType] constructor for store products.
@@ -14,7 +14,7 @@ package com.inappify.sdk
  * unique logical-attempt identifier of 1-128 letters, digits, `-`, `_`, `.`,
  * or `:`. Reuse it only when resuming that same purchase.
  */
-public class InappifyPurchaseRequest private constructor(
+internal class InappifyPurchaseRequest private constructor(
     public val productIdentifier: String,
     public val offeringIdentifier: String,
     public val packageIdentifier: String? = null,
@@ -23,6 +23,7 @@ public class InappifyPurchaseRequest private constructor(
     public val appVersion: String? = null,
     public val apiKey: String? = null,
     public val discount: Long = 0L,
+    @Deprecated("Legacy compatibility only. Crypto checkout is unsupported; use InappifyPurchaseParams.")
     public val isCrypto: Boolean = false,
     public val market: InappifyMarket = InappifyMarket.NONE,
     public val marketKey: String? = null,

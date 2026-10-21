@@ -163,7 +163,10 @@ class V2ProtocolTest {
         assertTrue(validAttribute("campaign", "😀".repeat(500)))
         assertFalse(validAttribute("campaign", "😀".repeat(501)))
         assertTrue(validAttribute("\$email", null))
-        assertFalse(validAttribute("\$ip", "1.2.3.4"))
+        assertTrue(validAttribute("\$ip", "1.2.3.4"))
+        assertTrue(validAttribute("\$ip", "2001:db8::1"))
+        assertTrue(validAttribute("\$ip", null))
+        assertFalse(validAttribute("\$unknown", "value"))
         assertFalse(validAttribute("1startsWithDigit", "x"))
     }
     @Test fun exactHttpsAllowlistRejectsSpoofedUrls() {

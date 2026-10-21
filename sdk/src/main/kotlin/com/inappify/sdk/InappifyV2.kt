@@ -77,15 +77,11 @@ public enum class InappifyFetchPolicy { CACHE_ONLY, CACHE_FIRST, NETWORK_FIRST, 
 
 /** Additional V2 session, cache and recovery APIs. */
 public interface InappifyV2Client : InappifyClient {
-    public val hasForceUpdate: Boolean
     public val isLogoutPending: Boolean
     public suspend fun customerInfo(policy: InappifyFetchPolicy): InappifyResult<InappifyCustomerInfo>
     public suspend fun offerings(policy: InappifyFetchPolicy): InappifyResult<InappifyOfferings>
-    /** Queues write-only values durably; null or empty string deletes a value. */
-    public suspend fun queueAttributes(values: Map<String, String?>): InappifyResult<Unit>
-    public suspend fun flushAttributes(): InappifyResult<Unit>
-    /** Invoke on foreground, connectivity restoration, and return from a payment URL. */
-    public suspend fun recover(): InappifyResult<Unit>
+    /** Forward custom/legacy routing here; only marked InAppify payment-return URLs are handled. */
+    public fun handleDeepLink(url: String): Boolean = false
     /** Stops v2 network use without discarding verified cache; host owns rollout flags. */
     public fun setNetworkEnabled(enabled: Boolean)
     public companion object {

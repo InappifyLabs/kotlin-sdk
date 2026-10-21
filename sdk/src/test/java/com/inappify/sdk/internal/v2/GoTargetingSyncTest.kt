@@ -40,7 +40,7 @@ class GoTargetingSyncTest {
         client().use { sdk ->
             assertTrue(sdk.configure(InappifyOptions("fixture-key", appUserIdentifier = signing.subject)) is InappifyResult.Success)
             val values = (1..51).associate { "key$it" to "value$it" } + ("deleted" to null)
-            assertTrue(sdk.queueAttributes(values) is InappifyResult.Success)
+            assertTrue(sdk.enqueueAttributes(values) is InappifyResult.Success)
             transport.requests.clear()
             val result = sdk.syncAttributesAndOfferingsIfNeeded() as InappifyResult.Success
             assertEquals(listOf("attributes", "attributes", "offerings"), transport.requests.map { it.path })
@@ -59,7 +59,7 @@ class GoTargetingSyncTest {
     @Test fun rejectedLaterBatchIsQuarantinedAndStopsOfferingsUntilCallerCorrectsIt() = runBlocking {
         client().use { sdk ->
             assertTrue(sdk.configure(InappifyOptions("fixture-key", appUserIdentifier = signing.subject)) is InappifyResult.Success)
-            assertTrue(sdk.queueAttributes((1..51).associate { "key$it" to "value$it" }) is InappifyResult.Success)
+            assertTrue(sdk.enqueueAttributes((1..51).associate { "key$it" to "value$it" }) is InappifyResult.Success)
             transport.requests.clear()
             rejectSecondBatch = true
             assertTrue(sdk.syncAttributesAndOfferingsIfNeeded() is InappifyResult.Failure)
@@ -67,7 +67,7 @@ class GoTargetingSyncTest {
             val saved = jsonObject(store.value!!.customerInfoJson!!)
             assertEquals(0, saved.getAsJsonObject("attributes").size())
             assertEquals("value51", saved.getAsJsonObject("quarantine").get("key51").asString)
-            assertTrue(sdk.queueAttributes(mapOf("key51" to "corrected")) is InappifyResult.Success)
+            assertTrue(sdk.enqueueAttributes(mapOf("key51" to "corrected")) is InappifyResult.Success)
             transport.requests.clear()
             assertTrue(sdk.syncAttributesAndOfferingsIfNeeded() is InappifyResult.Success)
             assertEquals(listOf("attributes", "offerings"), transport.requests.map { it.path })
@@ -80,7 +80,7 @@ class GoTargetingSyncTest {
         client().use { sdk ->
             assertTrue(sdk.configure(InappifyOptions("fixture-key", appUserIdentifier = signing.subject)) is InappifyResult.Success)
             repeat(5) { assertTrue(sdk.syncAttributesAndOfferingsIfNeeded() is InappifyResult.Success) }
-            assertTrue(sdk.queueAttributes(mapOf("tier" to "new")) is InappifyResult.Success)
+            assertTrue(sdk.enqueueAttributes(mapOf("tier" to "new")) is InappifyResult.Success)
             transport.requests.clear()
             val result = sdk.syncAttributesAndOfferingsIfNeeded() as InappifyResult.Failure
             assertEquals("RATE_LIMITED_NO_CACHE", result.error.details["reason"])

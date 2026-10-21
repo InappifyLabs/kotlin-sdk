@@ -2,13 +2,13 @@
 
 Repository: <https://github.com/InappifyLabs/kotlin-sdk>.
 
-The runtime version in `gradle.properties` is `0.1.1`. Beta versions use
+The runtime version in `gradle.properties` is `0.2.0`. Beta versions use
 `major.minor.patch-beta.N`; stable versions use `major.minor.patch`. Git tags
-prefix this value with `v`, so this release is tagged `v0.1.1`. JitPack
+prefix this value with `v`, so this release is tagged `v0.2.0`. JitPack
 consumers use the tag verbatim:
 
 ```kotlin
-implementation("com.github.InappifyLabs:kotlin-sdk:v0.1.1")
+implementation("com.github.InappifyLabs:kotlin-sdk:v0.2.0")
 ```
 
 `BuildConfig.SDK_VERSION`, Configure's `sdkVersion`, SDK user-agent and snapshots

@@ -91,7 +91,7 @@ class GoBillingLifecycleTest(private val nativeMarket: InappifyMarket) {
     @Test fun closeCancelsAnOwnedQueryAndClosesItsAdapter() = runBlocking {
         val sdk = client()
         configure(sdk)
-        val operation = async { sdk.syncPurchases() }
+        val operation = async { sdk.syncStorePurchases() }
         started.await()
         sdk.close()
         withTimeout(2000) { operation.join() }
@@ -104,7 +104,7 @@ class GoBillingLifecycleTest(private val nativeMarket: InappifyMarket) {
     @Test fun callerCancellationClosesOnlyItsAdapterAndLeavesTheClientUsable() = runBlocking {
         client().use { sdk ->
             configure(sdk)
-            val operation = async { sdk.syncPurchases() }
+            val operation = async { sdk.syncStorePurchases() }
             started.await()
             operation.cancelAndJoin()
             assertEquals(1, adapterCloses)
@@ -123,7 +123,7 @@ class GoBillingLifecycleTest(private val nativeMarket: InappifyMarket) {
             "com.example.mobile", 12, "product", "default", PendingStoreProductType.CONSUMABLE,
             PendingStorePurchaseEvidence("fixture-store-token"), PendingStoreOperationPhase.CONSUME_REQUIRED,
             deliveryId = 7, deliveryAcknowledged = true, createdAtEpochMillis = fixture.now)
-        val operation = async { sdk.syncPurchases() }
+        val operation = async { sdk.syncStorePurchases() }
         started.await()
         sdk.close()
         withTimeout(2000) { operation.join() }

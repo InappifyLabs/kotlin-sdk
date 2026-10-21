@@ -64,6 +64,7 @@ kotlin {
 
 dependencies {
     implementation(libs.androidx.fragment)
+    implementation(libs.androidx.lifecycle.process)
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.gson)
     implementation(libs.okhttp)

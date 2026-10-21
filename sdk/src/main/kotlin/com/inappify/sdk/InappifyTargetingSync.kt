@@ -1,15 +1,15 @@
 package com.inappify.sdk
 
-/** Optional capability; existing client implementations keep their original JVM interface. */
+/** Optional capability for combined attribute and Offering synchronization. */
 internal interface TargetingSyncCapableClient {
     suspend fun syncAttributesAndOfferingsIfNeededInternal(): InappifyResult<InappifyOfferings>
 }
 
 /**
  * Synchronizes subscriber attributes, then fetches fresh offerings for the current customer.
- * Await attribute setters (or Go [InappifyV2Client.queueAttributes]) before calling this method
- * when targeting rules depend on custom attributes. Attributes are uploaded, not downloaded
- * through a new endpoint: V1 synchronizes its current list and Go flushes its write-only queue.
+ * Await [InappifyClient.setAttributes] or reserved-attribute setters before calling this method
+ * when targeting rules depend on custom attributes. Attributes are uploaded through the
+ * existing attributes endpoint by flushing the write-only queue; they are not downloaded.
  *
  * Admitted calls never use cached offerings as their result or as a network-error fallback.
  * Successful responses update the normal snapshot, persistent cache and events. A failed
@@ -23,8 +23,7 @@ internal interface TargetingSyncCapableClient {
  * in its details. The limit is in-memory, per client, is not reset by login/logout, and does not
  * rate-limit other SDK methods or individual protocol retries/batches within an admitted call.
  *
- * Custom clients without this capability return UNSUPPORTED_OPERATION. This extension does not
- * add an abstract member to the published V1 interface or implicitly change protocols.
+ * Custom clients without this capability return UNSUPPORTED_OPERATION.
  */
 public suspend fun InappifyClient.syncAttributesAndOfferingsIfNeeded(): InappifyResult<InappifyOfferings> =
     if (this is TargetingSyncCapableClient) {

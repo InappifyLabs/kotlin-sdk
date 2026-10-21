@@ -54,6 +54,7 @@ internal data class RejectedStoreEvidenceTombstone(
     internal val productTypeFingerprint: String,
     internal val offeringIdentifierFingerprint: String,
     internal val appVersionFingerprint: String,
+    /** Opaque legacy journal field; never used to request or enforce an app update. */
     internal val forceVersionFingerprint: String,
     /**
      * Added without changing the encrypted schema version. The legacy marker

@@ -20,6 +20,7 @@ import com.inappify.sdk.InappifyPackage
 import com.inappify.sdk.InappifyPlacement
 import com.inappify.sdk.InappifyPlacementOffering
 import com.inappify.sdk.InappifyPrice
+import com.inappify.sdk.InappifyProductType
 import com.inappify.sdk.InappifyPurchaseLink
 import com.inappify.sdk.InappifyRule
 import com.inappify.sdk.InappifyStoreProduct
@@ -230,14 +231,13 @@ internal object InappifyDomainJsonCodec {
                     key to if (value.isJsonNull) null else value.requireString("$path.placements")
                 }
             return InappifyOfferings.serverTargeted(mergedItems,
-                source.long(path, "forceVersion", "force_version"), source.string(path, "fetchedAt", "fetched_at"),
+                source.string(path, "fetchedAt", "fetched_at"),
                 source.string(path, "currentOffering"), placements)
         }
 
         return InappifyOfferings(
             offerings = mergedItems,
             rules = parseObjectList(source.field("rules"), "$path.rules", ::parseRule),
-            forceVersion = source.long(path, "forceVersion", "force_version"),
             fetchedAt = source.string(path, "fetchedAt", "fetched_at"),
         )
     }
@@ -323,6 +323,9 @@ internal object InappifyDomainJsonCodec {
             },
             dollarPrice = source.double(path, "dollarPrice", "dollar_price"),
             trialDays = source.long(path, "trialDays", "trial_days"),
+            productType = source.field("productType", "product_type")
+                ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }
+                ?.asString?.let { value -> InappifyProductType.values().firstOrNull { it.name == value } },
         )
 
     private fun parsePrice(
@@ -424,7 +427,7 @@ internal object InappifyDomainJsonCodec {
             addString("requestDate", model.requestDate)
             addString("latestExpirationDate", model.latestExpirationDate)
             addBoolean("hasUsedTrial", model.hasUsedTrial)
-            add("entitlements", model.entitlements.toJsonArray(::encodeEntitlement))
+            add("entitlements", model.entitlementList.toJsonArray(::encodeEntitlement))
             add("transactions", model.transactions.toJsonArray(::encodeTransaction))
             add("attributes", model.attributes.toJsonArray(::encodeAttribute))
         }
@@ -486,7 +489,6 @@ internal object InappifyDomainJsonCodec {
         JsonObject().apply {
             add("offerings", model.offerings.toJsonArray(::encodeOffering))
             add("rules", model.rules.toJsonArray(::encodeRule))
-            addLong("forceVersion", model.forceVersion)
             addString("fetchedAt", model.fetchedAt)
             if (model.usesServerTargeting) {
                 addString("currentOffering", model.currentOfferingIdentifier)
@@ -526,6 +528,7 @@ internal object InappifyDomainJsonCodec {
             add("price", model.prices.toJsonArray(::encodePrice))
             addDouble("dollarPrice", model.dollarPrice)
             addLong("trialDays", model.trialDays)
+            model.productType?.let { addProperty("productType", it.name) }
         }
 
     private fun encodePrice(model: InappifyPrice): JsonObject =

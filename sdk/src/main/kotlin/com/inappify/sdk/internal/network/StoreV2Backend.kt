@@ -137,8 +137,6 @@ internal class StorePurchaseState(
 internal class StoreBackendResponse(
     internal val status: Boolean?,
     internal val state: StorePurchaseState?,
-    internal val hasForceUpdate: Boolean?,
-    internal val forceVersion: Long?,
     internal val errorCode: String?,
     internal val message: String?,
 ) {
@@ -146,8 +144,6 @@ internal class StoreBackendResponse(
         "StoreBackendResponse(" +
             "status=$status, " +
             "state=$state, " +
-            "hasForceUpdate=$hasForceUpdate, " +
-            "forceVersion=$forceVersion, " +
             "errorCode=<redacted>, " +
             "message=<redacted>" +
             ")"

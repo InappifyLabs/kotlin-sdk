@@ -146,7 +146,6 @@ class InappifyFacadeHelpersTest {
             appVersion = "1.0.0",
             sdkVersion = "test",
             storeInfo = null,
-            forceVersion = 1,
             appId = null,
             customerInfo = customerInfo,
             offerings = null,

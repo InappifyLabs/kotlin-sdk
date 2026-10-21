@@ -4,7 +4,7 @@ The client reconciles store-owned receipts with Inappify and resumes encrypted c
 
 This document describes the current Android implementation and the HTTP contract it expects. It does not establish that a particular commerce backend has deployed the subscription-recovery endpoint or that a live store renewal has been tested.
 
-## Startup and explicit recovery
+## Startup and automatic recovery
 
 `InappifyClient.create(context)` returns an `InappifyV2Client`. Configure it after resolving the current application account:
 
@@ -15,54 +15,181 @@ suspend fun configureRecoverySession(
     client: InappifyV2Client,
     inappifyApiKey: String,
     currentAppUserId: String?,
-    bazaarRsaPublicKey: String,
 ): InappifyResult<Unit> = client.configure(
     InappifyOptions(
         apiKey = inappifyApiKey,
         appUserIdentifier = currentAppUserId,
-        market = InappifyMarket.BAZAAR,
-        marketKey = bazaarRsaPublicKey,
     ),
 )
 ```
 
-Configure schedules recovery after accepting an online session, reusing a matching unexpired cached session, or completing a pending login. Configure success does not wait for the background recovery result. Configure on each application startup is the startup trigger; the SDK does not own the host's process/foreground lifecycle.
+Configure schedules recovery after accepting an online session, reusing a matching unexpired cached session, or completing a pending login. Configure success does not wait for the background recovery result. The SDK also observes process foreground through AndroidX and restored internet through Android connectivity monitoring. Networking must be enabled and internet available for automatic recovery admission.
 
-For `Bazar` and `MyKet`, `recover()` runs these steps:
+On foreground or restored internet, a recovery pass is eligible when the current
+customer has unfinished purchase checkpoints, no successful pass has completed
+in this client, or at least five minutes have elapsed since the last successful
+pass. A failed pass blocks automatic retries for at least thirty seconds, even
+when a pending purchase exists. A later qualifying event retries; no periodic
+timer is started. Configure/Login retain startup scheduling, subject to the same
+network availability and failure backoff. A new accepted customer gets its own
+schedule. Reenabling SDK networking checks the same event condition.
+
+Pending native operations must match store, endpoint/API-key fingerprint,
+customer fingerprint, app ID and Android package. For DirectAndroid, unfinished
+delivery records in the current identity-bound document count; completed records
+do not. These checks only read existing checkpoints and never query the store or
+renew the session to decide eligibility. Previously unknown owned receipts or
+server deliveries are discovered by startup, a due pass or a manual purchase sync.
+
+Recovery clocks use monotonic time and live only in memory. No session-cache or
+purchase-journal fields are added. [Android connectivity monitoring](https://developer.android.com/develop/connectivity/network-ops/reading-network-state)
+uses the merged normal
+`ACCESS_NETWORK_STATE` permission, with no runtime permission prompt. Initial
+online status and duplicate connectivity callbacks are not reconnect events.
+
+Do not manually pre-warm Offerings in `Application.onCreate`. The Offering step
+of automatic recovery waits until the app is visible and the catalog is missing
+or at least five minutes old. Entering the foreground also checks this condition.
+These checks do not create a periodic timer. A push-only process start does not
+start automatic Offering prefetch. Explicit SDK calls and existing customer and
+purchase recovery can still use the network in the background.
+
+For `Bazar` and `MyKet`, internal automatic recovery runs these steps:
 
 1. Resolve a pending logout or login before ordinary work.
 2. Refresh CustomerInfo for the current session.
 3. Resume matching pending store operations and query owned inventory, including consumable delivery work.
-4. Refresh Offerings after store reconciliation.
+4. Refresh Offerings after store reconciliation, using the existing foreground/freshness checks for automatic passes.
 
 A CustomerInfo refresh failure does not prevent the store reconciliation attempt. In that case, stale cached entitlements are not used to discard newly discovered receipts. Offerings failure also does not prevent the preceding store query. The returned recovery failure still reports failed work; the client does not convert partial progress into a successful full refresh.
 
 For `DirectAndroid`, recovery refreshes CustomerInfo and Offerings before reconciling the server consumable-delivery queue. Other session store platforms do not acquire Bazaar or Myket billing automatically.
 
-Call recovery from host-owned coroutine/lifecycle work on foreground, connectivity restoration, and return from a payment UI:
+Foreground and connectivity observation are automatic. Recovery is internal and
+is not a public SDK method. For a manual purchase check, call
+`client.syncStorePurchases()`; for a user-initiated Restore Purchases action, call
+`client.restoreStorePurchases()`. Neither method requires parameters.
 
-```kotlin
-import com.inappify.sdk.*
+Configure and Login register automatic recovery immediately with one client-owned
+coordinator. Concurrent events for the accepted customer binding share a pass.
+Configure/Login success does not wait for recovery to finish.
 
-suspend fun recoverOnForeground(
-    client: InappifyV2Client,
-): InappifyResult<Unit> = client.recover()
+When an accepted customer binding changes, one new pass is queued after the
+active pass. Further calls for that new binding join its queued pass. A stage
+from the previous binding cannot perform I/O using the new customer's session;
+the superseded pass reports `RECOVERY_SUPERSEDED` if it still has work to do.
+Pending identity barriers and rejected Login attempts retain their existing
+semantics. The coordinator's identity generation exists only in memory; it adds
+no fields to session cache or purchase journals.
+
+Canceling one waiter does not cancel client-owned recovery. Closing the client
+cancels active and queued passes and releases billing resources and both process
+and connectivity observers. Foreground/reconnect events during an active pass
+reuse that work rather than queueing retries behind it. Purchase uses the
+checks below. There is no periodic
+background worker or guaranteed recovery while the application is closed.
+
+### InAppify payment-return links
+
+For requests advertising payment-return capability, Laravel adds these reserved
+query fields to the configured native app return URL:
+
+```text
+myapp://any-route?existing=value&inappify_return=payment_v1&inappify_app_id=12&inappify_return_id=payment-123#screen
 ```
 
-Concurrent recovery calls share a client-owned request flight. Canceling one waiter does not cancel that shared flight. Closing the client cancels its operations and billing resources. There is no periodic background worker or guaranteed recovery while the application is closed.
+The app keeps its scheme/host/path, existing query fields and fragment. Native
+actions in purchase links use the selected native app ID; PWA actions stay
+unchanged. The marker is a synchronization hint, not a signature or proof that
+payment succeeded. The SDK ignores any `status`/transaction claims as payment
+authority and recovers using its authenticated current session.
+
+The new SDK internally sends `paymentReturnVersion: 1` on direct checkout and
+discount-link requests. No extra Configure parameter or persisted cache field is
+needed. Go adds `inappify_payment_return=1` and the authenticated app ID as
+`inappify_return_app_id` to capable discount checkout links. Checkout retains that
+hint through discount changes; Laravel marks only the matching registered native
+target. Old SDK requests, ordinary purchase links and existing return snapshots
+keep their previous URLs exactly. The return URL is decided when the payment is
+created; callback rendering never retrofits markers. Unknown capability versions
+fall back to unmarked links. Deploy Laravel/checkout, then Go, before the new SDK.
+
+SDK-created clients observe Activity VIEW intents and AndroidX
+[new-intent callbacks](https://developer.android.com/reference/androidx/core/app/OnNewIntentProvider).
+Create the application-scoped client before Activity startup for automatic cold
+intent observation. A custom router, late initialization, or a plain Activity
+without `OnNewIntentProvider` should forward URLs explicitly:
+
+```kotlin
+intent.dataString?.let(client::handleDeepLink)
+// In a custom Activity's onNewIntent, forward that new Intent's dataString too.
+```
+
+`handleDeepLink(url)` returns whether the reserved payment-return marker was
+recognized/queued; it does not indicate payment success or completed sync. It
+can receive all routed links: ordinary links, unsupported versions, malformed
+or duplicate reserved fields and another configured app's ID do not force
+recovery. Host navigation/Intent data is never changed. The existing general
+foreground freshness rule still applies independently.
+
+A matching marker forces a fresh recovery without waiting five minutes.
+Startup work admitted after the marker can be shared; a pass admitted before
+the return finishes before one fresh pass is requested. Concurrent/recently
+successful return IDs are deduplicated in bounded runtime memory. Before
+Configure or while offline/disabled, the hint waits for a valid session/network.
+The thirty-second recovery error backoff still applies; a pending return can
+wait out that delay without blocking the host UI. Failures remain retryable by
+a later link/lifecycle/network event. Closing the client removes observers and
+cancels deferred work. No cache/journal schema or grant/consume logic changes.
+
+### Before a new purchase
+
+Every purchase overload waits for an already active recovery pass for its
+accepted customer. Waiting happens outside the state mutex, so recovery can
+finish. Canceling the purchase waiter leaves client-owned recovery running;
+closing the client cancels both. If the accepted customer changes while waiting,
+purchase fails with `PURCHASE_CONTEXT_CHANGED` before opening payment UI.
+
+A joining purchase can return the matching paid result from that pass, including
+when recovery has already removed its completed checkpoint. The pass retains
+these outcomes only in memory for its waiters; subsequent deliberate purchases
+do not reuse a terminal purchase cache. A recovery failure for CustomerInfo,
+Offerings or another product does not override a valid matching purchase result.
+Normal session/catalog validation still applies when starting fresh work.
+
+Without a matching joined result, the SDK checks existing paid work for this
+product and current customer/app/store/endpoint. A native checkpoint resumes
+through the existing store coordinator and returns its existing typed status or
+failure. Its original Offering and Package remain attached, even when the current
+catalog changed. Explicit attempt IDs keep their existing binding/conflict
+validation. Verification, delivery and consumption backoff remain authoritative;
+an unresolved attempt does not open a second billing UI.
+
+For DirectAndroid, a known unfinished delivery for this product returns
+`DELIVERY_REQUIRED`, or resumes acknowledgement when a host grant was already
+durably marked. Purchase does not invoke a new host grant or consume an item on
+that basis. Other products' deliveries and completed Direct records do not block
+a fresh checkout. The usual delivery-handler/`confirmDelivery` flow still owns
+fulfillment.
+
+These checks do not start a full recovery, scan store inventory or fetch the
+server delivery queue before every purchase. Startup, foreground/reconnection
+recovery and explicit sync discover previously unknown work. Direct checkout
+URLs and uncertain checkout creation are not durable delivery checkpoints;
+return from payment still requires explicit recovery. No request fields,
+purchase result types, receipt evidence or cache/journal formats change.
 
 ### Related public methods
 
 | Method | Behavior |
 | --- | --- |
-| `recover()` | Lifecycle recovery, CustomerInfo refresh, native reconciliation and Offerings refresh |
-| `syncPurchases()` | Reconcile pending operations and owned inventory for the current native store, or the delivery queue for `DirectAndroid`; refresh CustomerInfo after success |
-| `restorePurchases()` | Reconcile owned subscriptions/known non-consumables with independent restored/already-processed/failed counts; refresh CustomerInfo after success |
+| `syncStorePurchases()` | Reconcile pending operations and owned inventory for the current native store, or the delivery queue for `DirectAndroid`; refresh CustomerInfo after success |
+| `restoreStorePurchases()` | Host-initiated restore of owned subscriptions/known non-consumables with independent restored/already-processed/failed counts; refresh CustomerInfo after success |
 | `syncPendingConsumables()` | Reconcile native receipts and delivery checkpoints, invoke a registered delivery handler, and return remaining deliveries |
 | `confirmDelivery(deliveryId)` | Persist host acknowledgement, send it to Inappify, then perform store consumption/reporting |
 | `setNetworkEnabled(false)` | Block SDK/commerce HTTP use while retaining verified cache and journals |
 
-`restoreCachedSession(options)` is not implemented by the production V2 client and returns `UNSUPPORTED_OPERATION`. Use Configure's validated cache path and the fetch policies below. It is not a network-free startup API for this client.
+Use Configure's validated cache path and the fetch policies below. Configure may need the network to establish or renew its session.
 
 ## Owned inventory and bound receipts
 
@@ -97,29 +224,9 @@ Bazaar query collection uses a two-second callback idle window and deduplicates 
 
 ## Bazaar subscriptions without a developer payload
 
-`InappifyOptions.enableSubscriptionRecoveryWithoutPayload` is `true` by default. It enables a separate, server-resolved recovery operation only for a receipt returned by Bazaar's subscription query with a blank developer payload.
+Subscription recovery remains enabled internally. It uses a separate, server-resolved recovery operation only for a receipt returned by Bazaar's subscription query with a blank developer payload.
 
-The receipt must still have the correct Android package, a nonblank token, a positive millisecond purchase time, and the original signed store JSON/signature. The regular bound receipt path remains unchanged. This option does not cover Myket, in-app purchases, malformed nonblank payloads, or invalid bindings.
-
-To disable this operation explicitly:
-
-```kotlin
-import com.inappify.sdk.*
-
-fun optionsWithoutPayloadlessRecovery(
-    inappifyApiKey: String,
-    currentAppUserId: String?,
-    bazaarRsaPublicKey: String,
-): InappifyOptions = InappifyOptions(
-    apiKey = inappifyApiKey,
-    appUserIdentifier = currentAppUserId,
-    market = InappifyMarket.BAZAAR,
-    marketKey = bazaarRsaPublicKey,
-    enableSubscriptionRecoveryWithoutPayload = false,
-)
-```
-
-When disabled, newly discovered blank-payload subscriptions are skipped, and existing `RECOVER_SUBSCRIPTION` checkpoints remain pending without registration or polling. The flag does not delete journals and does not stop ordinary bound-receipt recovery or other purchase flows. Re-enable it to resume those checkpoints when the backend contract is available.
+The receipt must still have the correct Android package, a nonblank token, a positive millisecond purchase time, and the original signed store JSON/signature. The regular bound receipt path remains unchanged. This workflow does not cover Myket, in-app purchases, malformed nonblank payloads, or invalid bindings.
 
 ### Request contract
 
@@ -232,11 +339,38 @@ A matching, unexpired cached session with unchanged country/app version can avoi
 | Fetch policy | CustomerInfo and Offerings behavior |
 | --- | --- |
 | `CACHE_ONLY` | Return available cached data; fail with `CACHE_MISS` otherwise |
-| `CACHE_FIRST` | Return available cache immediately and schedule a resource refresh; otherwise use the network |
+| `CACHE_FIRST` | Return available cache immediately; CustomerInfo schedules its existing refresh, Offerings refreshes automatically only when foreground and stale; a cache miss uses the network |
 | `NETWORK_FIRST` | Try the network and fall back to available cache on failure |
 | `NETWORK_ONLY` | Use the network and report failures |
 
-`getCustomerInfo()` defaults to `forceRefresh = true` and uses `NETWORK_ONLY`; `getCustomerInfo(forceRefresh = false)` uses `CACHE_FIRST`. `getOfferings()` uses `CACHE_FIRST`, and both resource refresh methods use `NETWORK_ONLY`. There is no fixed freshness TTL applied to the production cached getter. A failed refresh retains previously published cache. A country/app-version change invalidates cached Offerings before reuse, and accepting a new session clears Offerings so server targeting can be fetched again. Offerings fetch flushes queued attributes first.
+`getCustomerInfo()` defaults to `InappifyCacheFetchPolicy.CACHED_OR_FETCHED`: return
+verified cache immediately and refresh it when stale, or wait for the server when
+cache is absent. CustomerInfo is fresh for five minutes in the foreground and
+twenty-five hours in the background. This reuses the existing persisted
+`infoFetchedAt` timestamp, including after restart. Foreground transitions and
+restored connectivity also check freshness; no polling timer is created.
+`CACHE_ONLY` never fetches. `FETCH_CURRENT` always waits for the server.
+`NOT_STALE_CACHED_OR_CURRENT` accepts fresh cache or waits for the server; network
+failure remains a failure even if stale cache is retained. Failed refresh never
+replaces verified cache. Advanced `customerInfo(policy)` keeps its explicit
+cache/network behavior, including network-first
+fallback; purchase, entitlement checks and recovery retain forced refreshes.
+
+`entitlements.all` includes active, expired and inactive known rights;
+`entitlements.active` checks active status and expiry against the trusted clock
+at access time. `entitlements[identifier]` looks up any known right. These views
+do not fetch or write cache, and the existing nullable array encoding is retained.
+
+`getOfferings()` uses `CACHE_FIRST`: its cached result returns immediately, and automatic refresh is eligible after five minutes, only in the foreground. `getCurrentOffering(placementIdentifier)` uses the same cache/fetch flow before selection and has no `forceRefresh` parameter. Automatic Offering failures wait thirty seconds before the next foreground/read trigger retries. Concurrent automatic work is shared and rechecks freshness after acquiring the state lock. An explicit cache-miss read, `NETWORK_ONLY`, `NETWORK_FIRST` or admitted `syncAttributesAndOfferingsIfNeeded()` call still uses the network without this automatic delay. Use the combined sync method for manual refresh; it retains its separate five-per-minute limiter, which automatic refresh does not consume.
+
+Offering freshness and failure timestamps use a monotonic clock in memory only.
+No persisted cache fields, versions, scopes, fingerprints or store journals
+change. A restored disk catalog remains immediately usable and is considered
+eligible for one foreground validation because its runtime fetch time is unknown.
+A failed refresh retains previously published cache. A country/app-version change
+invalidates cached Offerings before reuse, and accepting a new session clears
+Offerings so server targeting can be fetched again. Offerings fetch flushes queued
+attributes first. Closing the client unregisters its process-lifecycle observer.
 
 Omitting `appUserIdentifier` during Configure can reuse the persisted identity, including a signed-in account; it is not an instruction to switch to an anonymous user. Supply the host's intended identity, and use login/logout deliberately. Resolve pending identity transitions before presenting account-specific purchasing UI. During pending logout or login, customer identity/CustomerInfo/Offerings are withheld and purchase work is blocked.
 

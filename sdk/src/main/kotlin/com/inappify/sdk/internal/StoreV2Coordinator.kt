@@ -48,7 +48,6 @@ internal class StoreV2Context(
     internal val appId: Long?,
     internal val country: String,
     internal val appVersion: String,
-    internal val forceVersion: Long?,
     internal val marketKey: String?,
     internal val market: InappifyMarket = InappifyMarket.BAZAAR,
     internal val subscriptionRecoveryEnabled: Boolean = true,
@@ -59,31 +58,26 @@ internal class StoreV2Context(
 /** Result of advancing one server-authoritative store operation. */
 internal sealed interface StoreV2Outcome {
     val operation: PendingStoreOperation
-    val forceVersion: Long?
 
     class Terminal(
         override val operation: PendingStoreOperation,
         internal val state: StorePurchaseState,
-        override val forceVersion: Long?,
     ) : StoreV2Outcome
 
     class PendingDelivery(
         override val operation: PendingStoreOperation,
         internal val state: StorePurchaseState,
-        override val forceVersion: Long?,
     ) : StoreV2Outcome
 
     class Deferred(
         override val operation: PendingStoreOperation,
         internal val state: StorePurchaseState?,
-        override val forceVersion: Long?,
         internal val error: InappifyError?,
     ) : StoreV2Outcome
 
     class Rejected(
         override val operation: PendingStoreOperation,
         internal val state: StorePurchaseState?,
-        override val forceVersion: Long?,
         internal val error: InappifyError,
         /** Suppresses only the exact unchanged evidence/configuration tuple. */
         internal val requiresRejectionTombstone: Boolean = false,
@@ -91,7 +85,6 @@ internal sealed interface StoreV2Outcome {
 
     class Failure(
         override val operation: PendingStoreOperation,
-        override val forceVersion: Long?,
         internal val error: InappifyError,
         internal val retainedForRetry: Boolean,
         internal val requiresRejectionTombstone: Boolean = false,
@@ -131,7 +124,7 @@ internal class StoreV2Coordinator(
         maxPolls: Int = MAX_FOREGROUND_POLLS,
     ): StoreV2Outcome {
         operation.bindingError(context)?.let {
-            return StoreV2Outcome.Failure(operation, null, it, retainedForRetry = true)
+            return StoreV2Outcome.Failure(operation, it, retainedForRetry = true)
         }
         if (!stateStore.upsertPendingStoreOperation(operation)) {
             return storageFailure(operation)
@@ -149,7 +142,6 @@ internal class StoreV2Coordinator(
         if (bindingError != null) {
             return StoreV2Outcome.Failure(
                 operation = operation,
-                forceVersion = null,
                 error = bindingError,
                 retainedForRetry = true,
             )
@@ -167,7 +159,6 @@ internal class StoreV2Coordinator(
         if (bindingError != null) {
             return StoreV2Outcome.Failure(
                 operation = operation,
-                forceVersion = null,
                 error = bindingError,
                 retainedForRetry = true,
             )
@@ -199,14 +190,13 @@ internal class StoreV2Coordinator(
         require(maxPolls >= 0) { "maxPolls must not be negative." }
         if (initial.operation == PendingStoreOperationType.RECOVER_SUBSCRIPTION &&
             !context.subscriptionRecoveryEnabled) {
-            return StoreV2Outcome.Deferred(initial, null, null, InappifyError(
+            return StoreV2Outcome.Deferred(initial, null, InappifyError(
                 InappifyErrorCode.INVALID_CONFIGURATION,
                 "Subscription recovery is disabled in this client configuration.",
                 details = mapOf("operation" to "subscriptionRecovery", "outcomeMayHaveCommitted" to true),
             ))
         }
         var operation = initial
-        var forceVersion: Long? = null
         var polls = 0
 
         while (true) {
@@ -216,7 +206,6 @@ internal class StoreV2Coordinator(
                         return StoreV2Outcome.Deferred(
                             operation = operation,
                             state = null,
-                            forceVersion = forceVersion,
                             error = null,
                         )
                     }
@@ -271,12 +260,10 @@ internal class StoreV2Coordinator(
                         )
                     ) {
                         is ApiEvaluation.State -> {
-                            forceVersion = monotonic(forceVersion, evaluated.forceVersion)
                             when (
                                 val applied = applyState(
                                     operation = operation,
                                     state = evaluated.state,
-                                    forceVersion = forceVersion,
                                     context = context,
                                 )
                             ) {
@@ -286,12 +273,11 @@ internal class StoreV2Coordinator(
                         }
 
                         is ApiEvaluation.Retry ->
-                            return defer(operation, forceVersion, evaluated.error, null)
+                            return defer(operation, evaluated.error, null)
                         is ApiEvaluation.Reject -> {
                             return StoreV2Outcome.Rejected(
                                 operation = operation,
                                 state = null,
-                                forceVersion = forceVersion,
                                 error = evaluated.error,
                                 requiresRejectionTombstone =
                                     evaluated.requiresRejectionTombstone,
@@ -305,7 +291,6 @@ internal class StoreV2Coordinator(
                         return StoreV2Outcome.Deferred(
                             operation = operation,
                             state = null,
-                            forceVersion = forceVersion,
                             error = null,
                         )
                     }
@@ -320,7 +305,6 @@ internal class StoreV2Coordinator(
                         return StoreV2Outcome.Deferred(
                             operation = operation,
                             state = null,
-                            forceVersion = forceVersion,
                             error = null,
                         )
                     }
@@ -337,12 +321,10 @@ internal class StoreV2Coordinator(
                         )
                     ) {
                         is ApiEvaluation.State -> {
-                            forceVersion = monotonic(forceVersion, evaluated.forceVersion)
                             when (
                                 val applied = applyState(
                                     operation = operation,
                                     state = evaluated.state,
-                                    forceVersion = forceVersion,
                                     context = context,
                                 )
                             ) {
@@ -352,12 +334,11 @@ internal class StoreV2Coordinator(
                         }
 
                         is ApiEvaluation.Retry ->
-                            return defer(operation, forceVersion, evaluated.error, null)
+                            return defer(operation, evaluated.error, null)
                         is ApiEvaluation.Reject -> {
                             return StoreV2Outcome.Rejected(
                                 operation = operation,
                                 state = null,
-                                forceVersion = forceVersion,
                                 error = evaluated.error,
                                 requiresRejectionTombstone =
                                     evaluated.requiresRejectionTombstone,
@@ -372,7 +353,6 @@ internal class StoreV2Coordinator(
                         state = operation.toSyntheticState(
                             StorePurchaseStatus.DELIVERY_REQUIRED,
                         ),
-                        forceVersion = forceVersion,
                     )
 
                 PendingStoreOperationPhase.DELIVERY_CONFIRMING -> {
@@ -380,7 +360,6 @@ internal class StoreV2Coordinator(
                         return StoreV2Outcome.Deferred(
                             operation = operation,
                             state = null,
-                            forceVersion = forceVersion,
                             error = null,
                         )
                     }
@@ -397,12 +376,10 @@ internal class StoreV2Coordinator(
                         )
                     ) {
                         is ApiEvaluation.State -> {
-                            forceVersion = monotonic(forceVersion, evaluated.forceVersion)
                             when (
                                 val applied = applyState(
                                     operation = operation,
                                     state = evaluated.state,
-                                    forceVersion = forceVersion,
                                     context = context,
                                 )
                             ) {
@@ -412,12 +389,11 @@ internal class StoreV2Coordinator(
                         }
 
                         is ApiEvaluation.Retry ->
-                            return defer(operation, forceVersion, evaluated.error, null)
+                            return defer(operation, evaluated.error, null)
                         is ApiEvaluation.Reject -> {
                             return StoreV2Outcome.Rejected(
                                 operation = operation,
                                 state = null,
-                                forceVersion = forceVersion,
                                 error = evaluated.error,
                                 requiresRejectionTombstone =
                                     evaluated.requiresRejectionTombstone,
@@ -431,7 +407,6 @@ internal class StoreV2Coordinator(
                         return StoreV2Outcome.Deferred(
                             operation = operation,
                             state = null,
-                            forceVersion = forceVersion,
                             error = null,
                         )
                     }
@@ -482,7 +457,6 @@ internal class StoreV2Coordinator(
                         return StoreV2Outcome.Deferred(
                             operation = operation,
                             state = null,
-                            forceVersion = forceVersion,
                             error = null,
                         )
                     }
@@ -505,7 +479,6 @@ internal class StoreV2Coordinator(
                         )
                     ) {
                         is ApiEvaluation.State -> {
-                            forceVersion = monotonic(forceVersion, evaluated.forceVersion)
                             if (
                                 consumeResult == PendingStoreConsumeResult.FAILED &&
                                 evaluated.state.status == StorePurchaseStatus.CONSUME_REQUIRED
@@ -535,7 +508,6 @@ internal class StoreV2Coordinator(
                                 return StoreV2Outcome.Deferred(
                                     operation = retrying,
                                     state = evaluated.state,
-                                    forceVersion = forceVersion,
                                     error = InappifyError(
                                         code = InappifyErrorCode.STORE_UNAVAILABLE,
                                         message = "The marketplace could not consume the purchase yet.",
@@ -551,7 +523,6 @@ internal class StoreV2Coordinator(
                                 val applied = applyState(
                                     operation = operation,
                                     state = evaluated.state,
-                                    forceVersion = forceVersion,
                                     context = context,
                                 )
                             ) {
@@ -561,12 +532,11 @@ internal class StoreV2Coordinator(
                         }
 
                         is ApiEvaluation.Retry ->
-                            return defer(operation, forceVersion, evaluated.error, null)
+                            return defer(operation, evaluated.error, null)
                         is ApiEvaluation.Reject -> {
                             return StoreV2Outcome.Rejected(
                                 operation = operation,
                                 state = null,
-                                forceVersion = forceVersion,
                                 error = evaluated.error,
                                 requiresRejectionTombstone =
                                     evaluated.requiresRejectionTombstone,
@@ -581,7 +551,6 @@ internal class StoreV2Coordinator(
     private suspend fun applyState(
         operation: PendingStoreOperation,
         state: StorePurchaseState,
-        forceVersion: Long?,
         context: StoreV2Context,
     ): AppliedState {
         return when (state.status) {
@@ -615,7 +584,6 @@ internal class StoreV2Coordinator(
                 AppliedState.Outcome(
                     StoreV2Outcome.Failure(
                         operation = operation,
-                        forceVersion = forceVersion,
                         error = InappifyError(
                             code = InappifyErrorCode.UNKNOWN,
                             message = "The completed store purchase checkpoint could not be finalized securely.",
@@ -630,7 +598,6 @@ internal class StoreV2Coordinator(
                     StoreV2Outcome.Terminal(
                         operation = operation,
                         state = state,
-                        forceVersion = forceVersion,
                     ),
                 )
             }
@@ -641,7 +608,6 @@ internal class StoreV2Coordinator(
                 StoreV2Outcome.Rejected(
                     operation = operation,
                     state = state,
-                    forceVersion = forceVersion,
                     error = rejectionError(state, operation, context),
                 ),
             )
@@ -730,7 +696,6 @@ internal class StoreV2Coordinator(
                     StoreV2Outcome.PendingDelivery(
                         operation = next,
                         state = state,
-                        forceVersion = forceVersion,
                     ),
                 )
             } else if (operation.deliveryAcknowledged) {
@@ -738,7 +703,6 @@ internal class StoreV2Coordinator(
                     StoreV2Outcome.Deferred(
                         operation = next,
                         state = state,
-                        forceVersion = forceVersion,
                         error = null,
                     ),
                 )
@@ -819,7 +783,6 @@ internal class StoreV2Coordinator(
                     StoreV2Outcome.Deferred(
                         operation = next,
                         state = state,
-                        forceVersion = forceVersion,
                         error = null,
                     ),
                 )
@@ -988,7 +951,7 @@ internal class StoreV2Coordinator(
                     message = "The store response does not match the pending purchase scope or delivery state.",
                     details = operation.safeDetails(context),
                 ), requiresRejectionTombstone = false)
-                else ApiEvaluation.State(state = received, forceVersion = payload.forceVersion)
+                else ApiEvaluation.State(state = received)
             }
         }
     }
@@ -1018,7 +981,6 @@ internal class StoreV2Coordinator(
 
     private suspend fun defer(
         operation: PendingStoreOperation,
-        forceVersion: Long?,
         error: InappifyError,
         state: StorePurchaseState?,
     ): StoreV2Outcome {
@@ -1032,7 +994,6 @@ internal class StoreV2Coordinator(
         return StoreV2Outcome.Deferred(
             operation = deferred,
             state = state,
-            forceVersion = forceVersion,
             error = if (retained) error else storageError(operation),
         )
     }
@@ -1045,7 +1006,6 @@ internal class StoreV2Coordinator(
     ): StoreV2Outcome.Failure {
         return StoreV2Outcome.Failure(
             operation = operation,
-            forceVersion = null,
             error = InappifyError(
                 code = code,
                 message = message,
@@ -1059,7 +1019,6 @@ internal class StoreV2Coordinator(
     private fun storageFailure(operation: PendingStoreOperation): StoreV2Outcome.Failure =
         StoreV2Outcome.Failure(
             operation = operation,
-            forceVersion = null,
             error = storageError(operation),
             retainedForRetry = false,
         )
@@ -1405,16 +1364,9 @@ internal class StoreV2Coordinator(
         class Complete(val values: List<String>) : JsonSecretExtraction
     }
 
-    private fun monotonic(current: Long?, received: Long?): Long? = when {
-        current == null -> received
-        received == null -> current
-        else -> max(current, received)
-    }
-
     private sealed interface ApiEvaluation {
         class State(
             val state: StorePurchaseState,
-            val forceVersion: Long?,
         ) : ApiEvaluation
 
         class Retry(val error: InappifyError) : ApiEvaluation

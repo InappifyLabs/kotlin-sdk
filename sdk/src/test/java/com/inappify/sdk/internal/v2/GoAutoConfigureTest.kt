@@ -155,7 +155,7 @@ class GoAutoConfigureTest {
             for (field in listOf("iss", "app_id", "project_id")) {
                 requests.handler = { requests.response(signing.envelope(sdk.snapshot.appUserIdentifier!!,
                     mutatePayload = { if (field == "iss") it.addProperty(field, "another-issuer") else it.addProperty(field, 99) })) }
-                assertTrue(sdk.refreshCustomerInfo() is InappifyResult.Failure)
+                assertTrue(sdk.getCustomerInfo(InappifyCacheFetchPolicy.FETCH_CURRENT) is InappifyResult.Failure)
                 assertEquals(scope, sdk.verifiedSessionScope)
                 assertTrue(sdk.snapshot.isConfigured)
             }
@@ -175,7 +175,7 @@ class GoAutoConfigureTest {
                 mutatePayload = { it.addProperty("project_id", 35) }).apply {
                     addProperty("sessionToken", "rejected-cross-project-token")
                 }) }
-            val rejected = sdk.login(InappifyLoginRequest(target)) as InappifyResult.Failure
+            val rejected = sdk.logIn(target) as InappifyResult.Failure
             assertEquals("SIGNATURE", rejected.error.details["category"])
             assertEquals("project_id", rejected.error.details["mismatchField"])
             assertEquals("login", rejected.error.details["operation"])
@@ -294,7 +294,7 @@ class GoAutoConfigureTest {
                     requests.response(signing.envelope(id))
                 }
             }
-            assertTrue(sdk.refreshCustomerInfo() is InappifyResult.Success)
+            assertTrue(sdk.getCustomerInfo(InappifyCacheFetchPolicy.FETCH_CURRENT) is InappifyResult.Success)
             assertEquals(listOf("customerInfo", "configure", "customerInfo"), requests.requests.map { it.path })
             assertEquals(id, sdk.snapshot.appUserIdentifier)
         }
@@ -306,7 +306,7 @@ class GoAutoConfigureTest {
             assertTrue(sdk.configure(options) is InappifyResult.Success)
             val before = sdk.snapshot.appUserIdentifier
             requests.handler = { TransportResult.Failure(TransportFailureKind.NETWORK) }
-            assertTrue(sdk.logout() is InappifyResult.Failure)
+            assertTrue(sdk.logOut() is InappifyResult.Failure)
             assertTrue(sdk.isLogoutPending); assertNull(sdk.verifiedSessionScope)
             val nextId = anonymousId()
             requests.handler = { requests.response(signing.envelope(nextId)) }

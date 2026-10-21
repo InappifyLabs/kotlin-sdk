@@ -10,15 +10,18 @@ internal interface StoreV2CapableClient {
 /**
  * Restores owned subscriptions and non-consumables independently.
  *
+ * Call explicitly from a host action such as a Restore Purchases button. The
+ * SDK's automatic recovery uses its recovery/sync flow, not this public method.
+ *
  * The production client continues after an individual item fails and refreshes
  * customer state after reconciliation. Clients without this capability use
- * [InappifyClient.syncPurchases] as a fallback.
+ * [InappifyClient.syncStorePurchases] as a fallback.
  */
-public suspend fun InappifyClient.restorePurchases(): InappifyResult<InappifyRestoreResult> =
+public suspend fun InappifyClient.restoreStorePurchases(): InappifyResult<InappifyRestoreResult> =
     if (this is StoreV2CapableClient) {
         restorePurchasesV2()
     } else {
-        when (val result = syncPurchases()) {
+        when (val result = syncStorePurchases()) {
             is InappifyResult.Success -> InappifyResult.Success(
                 data = InappifyRestoreResult(
                     restoredCount = result.data.size,

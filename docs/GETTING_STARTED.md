@@ -1,6 +1,6 @@
 # Getting started
 
-This guide uses `com.github.InappifyLabs:kotlin-sdk:v0.1.1` and the public
+This guide uses `com.github.InappifyLabs:kotlin-sdk:v0.2.0` and the public
 Kotlin package `com.inappify.sdk`. Follow [installation](../README.md#install)
 first. All SDK operations below are suspend functions unless stated otherwise.
 
@@ -11,11 +11,11 @@ same products, subscriptions and signing/package identity in the selected store.
 The offering's product identifier must match the store SKU; its package identifier
 is an Inappify catalog identifier, not the Android application ID.
 
-| Route | Configure market | Store setup |
+| Route | Selected by | Store setup |
 | --- | --- | --- |
-| Cafe Bazaar | `InappifyMarket.BAZAAR` | Bazaar app public RSA key, installed Bazaar, signed-in store account; in-app products and subscriptions |
-| Myket | `InappifyMarket.MYKET` | Myket app public RSA key, installed Myket, signed-in store account; consumable and non-consumable in-app products |
-| Direct | `InappifyMarket.NONE` | Inappify Direct Android route and permitted checkout provider |
+| Cafe Bazaar | Server session | Bazaar app public RSA key, installed Bazaar, signed-in store account; in-app products and subscriptions |
+| Myket | Server session | Myket app public RSA key, installed Myket, signed-in store account; consumable and non-consumable in-app products |
+| Direct | Server session | Inappify Direct Android route and permitted checkout provider |
 
 Myket subscriptions are unsupported. The SDK includes Poolakey for Bazaar and
 an isolated Myket billing implementation. Their merged manifests supply store
@@ -68,17 +68,10 @@ class BillingSession(
     suspend fun start(
         appPublicKey: String,
         currentCustomerId: String?,
-        market: InappifyMarket,
-        marketPublicRsaKey: String?,
-        recoverPayloadlessSubscriptions: Boolean = true,
     ): InappifyResult<Unit> = client.configure(
         InappifyOptions(
             apiKey = appPublicKey,
             appUserIdentifier = currentCustomerId,
-            market = market,
-            marketKey = marketPublicRsaKey,
-            enableSubscriptionRecoveryWithoutPayload =
-                recoverPayloadlessSubscriptions,
         ),
     )
 
@@ -121,26 +114,33 @@ import com.inappify.sdk.*
 suspend fun selectCustomer(
     client: InappifyV2Client,
     customerId: String,
-): InappifyResult<Unit> = client.login(
-    InappifyLoginRequest(
-        appUserIdentifier = customerId,
-    ),
-)
+): InappifyResult<Unit> = client.logIn(customerId)
 ```
 
 Login requires only the customer identifier and uses the current session Bearer.
 The app public key remains in Configure for session bootstrap and renewal. Await
-login before querying or purchasing for the new customer. `logout()` returns to
+login before querying or purchasing for the new customer. `logOut()` returns to
 an anonymous session. Uncertain identity
-transitions remain durable; call `recover()` to reconcile them. While logout is
-pending, `isLogoutPending` exposes the barrier and predecessor customer data is
+transitions remain durable and are reconciled by internal automatic recovery.
+While logout is pending, `isLogoutPending` exposes the barrier and predecessor customer data is
 hidden. `close()` releases resources and does not log out or delete paid work.
 
 ## Load targeted offerings
 
 Configure success does not imply that the background Offerings refresh has
 already finished. Fetch or synchronize offerings before displaying a paywall.
-Queue custom attributes before selecting the offering:
+Set custom attributes with a Map; null or empty values remove a key:
+
+```kotlin
+val result = client.setAttributes(
+    mapOf("city" to "Tehran", "old_attribute" to null)
+)
+```
+
+The setter validates and durably queues changes, then attempts to upload them.
+Failed transient uploads remain queued for recovery. The result does not contain
+the customer's stored attributes. You can also queue changes before explicitly
+synchronizing and selecting the offering:
 
 ```kotlin
 import com.inappify.sdk.*
@@ -149,8 +149,8 @@ suspend fun offeringForPaywall(
     client: InappifyV2Client,
     placement: String,
 ): InappifyResult<InappifyOffering?> {
-    when (val queued = client.queueAttributes(mapOf("family" to "true"))) {
-        is InappifyResult.Failure -> return queued
+    when (val updated = client.setAttributes(mapOf("family" to "true"))) {
+        is InappifyResult.Failure -> return updated
         is InappifyResult.Success -> Unit
     }
     when (val synced = client.syncAttributesAndOfferingsIfNeeded()) {
@@ -163,7 +163,7 @@ suspend fun offeringForPaywall(
 
 Fresh offerings requests flush the durable attribute queue first. The server
 performs targeting using the current session, queued attributes, country,
-appVersion and SDK version `0.1.1`. Configure/snapshots use this exact
+appVersion and SDK version `0.2.0`. Configure/snapshots use this exact
 version without the tag prefix; the client does not
 normalize it locally for selection. SDK version is separate from your app
 version. Current selection uses a matching placement offering, then the server's
@@ -173,23 +173,62 @@ version. Current selection uses a matching placement offering, then the server's
 60 seconds per client. Excess calls return current-session cached offerings or a
 rate-limit failure if no cache exists; they do not upload attributes or fetch
 fresh data. Do not use it as an unbounded polling loop. Use
-`refreshOfferings()` or `offerings(NETWORK_ONLY)` when your workflow specifically
-requires a new request, handling service limits normally.
+`getOfferings()` or `getCurrentOffering(placementIdentifier)` for ordinary cached
+reads. Use the combined sync method for manual refresh, including after changing
+attributes that affect targeting; `getCurrentOffering` has no `forceRefresh`
+parameter. Automatic Offering refresh does not
+consume this method's local quota; it has its own five-minute freshness window
+and thirty-second failure backoff.
 
-For changed country or app version, await `setTargetingContext`, then fetch fresh
-offerings. Country is normalized to two uppercase letters. Context changes
-invalidate catalog cache. The optional evaluation context passed to
-`getCurrentOffering` does not override server targeting on the production client.
+Do not call `getOfferings()` from `Application.onCreate` just to pre-warm cache.
+The SDK prefetches automatically once configured and foreground. Cached reads
+return immediately and only schedule a refresh when the catalog is stale and
+the app is visible. Returning to the foreground checks the same condition.
+There is no periodic Offering polling timer. Explicit cache-miss reads and forced
+network requests still work when called intentionally. Customer and purchase
+recovery retain their existing behavior.
 
-A package contains `identifier` and `product.identifier`; retain both from the
-selected offering. Product `prices` provide catalog price data. The API does not
-expose a product-type field in that catalog model: use your app's configured
-product classification when creating the purchase request.
+Select an exact Offering without implementing catalog fetching yourself:
+
+```kotlin
+val selected = client.getOffering("special_offer")
+```
+
+Or navigate the collection returned by `getOfferings()` or the combined sync:
+
+```kotlin
+when (val result = client.getOfferings()) {
+    is InappifyResult.Failure -> { /* handle result.error */ }
+    is InappifyResult.Success -> {
+        val offerings = result.data
+        val current = offerings.current
+        val special = offerings.getOffering("special_offer") // also offerings["special_offer"]
+        val onboarding = offerings.getCurrentOfferingForPlacement("onboarding")
+        val allById = offerings.all
+        val packages = special?.availablePackages.orEmpty()
+    }
+}
+```
+
+Exact ID lookups return null when absent. Placement selection preserves the
+current SDK fallback: placement, server Current, then catalog Default, even for
+a null placement mapping. Navigation does not fetch or mutate cached data.
+
+Country and app version are supplied automatically by the SDK, without a public
+override. Country is normalized to two uppercase letters. Attribute changes use
+`setAttributes`, which durably queues and sends writes and invalidates offerings.
+Use the combined sync method for a manual refresh. `getCurrentOffering` accepts
+only an optional placement identifier and uses the server's selection.
+
+A package contains `identifier`, `product.identifier` and its parent
+`offeringIdentifier`. `product.productType` reads the classification supplied by
+Go V2: `CONSUMABLE`, `NON_CONSUMABLE` or `SUBSCRIPTION`. Parent context is rebuilt
+when offerings are read, including from the existing cache. Product `prices`
+provide catalog price data.
 
 ## Start a store purchase
 
-Use the selected offering/package and a stable attempt ID. The following helper
-handles nullable catalog fields explicitly and calls the Activity overload:
+Pass a package from the selected offering and the current foreground Activity:
 
 ```kotlin
 import android.app.Activity
@@ -198,28 +237,34 @@ import com.inappify.sdk.*
 suspend fun buySelectedPackage(
     client: InappifyV2Client,
     activity: Activity,
-    offering: InappifyOffering,
     selected: InappifyPackage,
-    productType: InappifyProductType,
     attemptId: String,
 ): InappifyResult<InappifyPurchase> = client.purchase(
-    activity,
-    InappifyPurchaseRequest(
-        productIdentifier = requireNotNull(selected.product?.identifier),
-        offeringIdentifier = requireNotNull(offering.identifier),
-        packageIdentifier = requireNotNull(selected.identifier),
-        idempotencyKey = attemptId,
-        productType = productType,
-    ),
+    InappifyPurchaseParams.Builder(activity, selected)
+        .idempotencyKey(attemptId)
+        .build(),
 )
 ```
 
-Use `CONSUMABLE`, `NON_CONSUMABLE` or `SUBSCRIPTION` as configured for that SKU.
+The SDK obtains the identifiers and product type from that package, then invokes
+the same purchase, verification, recovery and delivery path as the request API.
+An unbound/incomplete package returns `PURCHASE_PACKAGE_CONTEXT_REQUIRED`. A
+native store package with missing/unknown product type returns
+`PRODUCT_TYPE_REQUIRED` without starting billing. Refresh offerings and ensure
+the catalog product is classified. Package period is never used to guess product type.
+
 Generate an attempt ID once for a deliberate purchase, persist it in your host
 workflow if retries can survive process restart, and reuse it only for the same
 logical store purchase. It must match `[A-Za-z0-9_.:-]{1,128}`. A retry of an
 existing paid store attempt resumes its durable work without reopening billing.
 A different product, customer or offering cannot reuse that attempt ID.
+
+Before purchase, the SDK waits for active recovery and checks known unfinished
+paid work for this product and customer. It may return the earlier paid result
+or `DELIVERY_REQUIRED` instead of opening payment UI again; handle the same
+purchase-result states below. A native checkpoint keeps its original Offering
+and Package even if the catalog changed. These checks do not start a full
+recovery for every purchase or change how your app grants consumables.
 
 The verified `storePlatform` controls the route. Leave request `market` at its
 default or, for a store, pass the matching market. Leave credential/context
@@ -244,7 +289,9 @@ operation, rather than a successful result carrying that state.
 
 Never unlock a subscription based on a native store receipt, URL return or
 purchase status alone. Use `client.hasEntitlement("your_entitlement")` for current
-verified state or `checkEntitlement` to refresh first.
+verified state. To refresh first, call
+`client.getCustomerInfo(InappifyCacheFetchPolicy.FETCH_CURRENT)` and check
+`result.data.entitlements.active.containsKey("your_entitlement")` on success.
 
 With the registered delivery handler, the SDK acknowledges only `DELIVERED` and
 then consumes a Bazaar/Myket consumable. `RETRY_LATER` preserves pending work.
@@ -256,10 +303,19 @@ the granted quantity from the product identifier.
 
 ## Direct checkout
 
-For an app configured as `DirectAndroid`, `purchase(request)` does not require a
-store Activity. Supply an offering product as above, keep `market = NONE`, and
-optionally use `isCrypto` or positive Direct paywall attribution via
-`withPaywallAttribution`. Direct checkout is created by the commerce service.
+For an app configured as `DirectAndroid`, omit the store Activity:
+
+```kotlin
+val result = client.purchase(
+    InappifyPurchaseParams.Builder(selectedPackage).build(),
+)
+```
+
+Optional Builder settings are `idempotencyKey(value)` and positive
+`paywallAttribution(id, revision)`. Direct checkout is
+created by the commerce service; `NEEDTOPAY` and the returned URL retain their
+existing meaning. The SDK does not open the browser or grant a consumable merely
+because checkout creation succeeded.
 
 Open a payment URL only after the SDK allowlist check:
 
@@ -283,23 +339,38 @@ fun openDirectPayment(
 
 The production allowlist permits HTTPS on `pay.inappify.com` at port 443 and
 rejects URL credentials. Do not log the checkout URL. Browser return and
-`purchaseStatus == DONE` are not consumable inventory grants. Call `recover()`
-and reconcile pending deliveries; verified CustomerInfo remains the entitlement
-source. Direct creation may have committed on a timeout; inspect
+`purchaseStatus == DONE` are not consumable inventory grants. Automatic recovery
+reconciles pending deliveries; use `syncPendingConsumables()` for a manual delivery
+check. Verified CustomerInfo remains the entitlement source. Direct creation may
+have committed on a timeout; inspect
 `error.details["outcomeMayHaveCommitted"]` and recover instead of blindly creating
 another checkout.
 
 ## Restore and automatic recovery
 
 After successful Configure, the SDK schedules recovery in the background.
-On foreground, restored connectivity and return from checkout, await
-`client.recover()` to reconcile lifecycle state, refresh CustomerInfo, sync
-pending deliveries/store inventory and refresh offerings. Store reconciliation
-is attempted even when CustomerInfo or Offerings refresh fails; the overall
-failure remains visible. No recovery method opens billing UI.
+It also observes process foreground and restored internet: recovery runs when
+the current customer has unfinished purchase checkpoints or the last successful
+pass is at least five minutes old. Automatic retries wait at least thirty seconds
+after a failed pass. No host lifecycle/network forwarding is required.
+Recovery is internal and requires no host lifecycle calls. Use
+`client.syncStorePurchases()` to await a manual purchase check, or
+`client.restoreStorePurchases()` for a user-initiated Restore Purchases action.
+Automatic store reconciliation is attempted even when CustomerInfo or Offerings
+refresh fails. No recovery method opens billing UI.
 
-`syncPurchases()` returns reconciled purchase results.
-`restorePurchases()` is an explicit restore action with independent restored,
+Native return URLs for requests from this SDK carry `inappify_return=payment_v1`,
+`inappify_app_id` and `inappify_return_id`. SDK-created clients observe Activity
+and AndroidX new intents and recover only marked returns for their app. For
+custom routing/late initialization, forward the URL with
+`client.handleDeepLink(url)`; forwarding ordinary links does not force recovery.
+Its Boolean result means recognized/queued, never payment success. See
+[payment-return handling](RECOVERY_AND_CACHE.md#inappify-payment-return-links).
+The SDK announces support internally on each checkout/discount-link request.
+Older SDK requests and existing payment return URLs remain unchanged.
+
+`syncStorePurchases()` returns reconciled purchase results.
+`restoreStorePurchases()` is an explicit restore action with independent restored,
 already-processed and failed counts. `syncPendingConsumables()` also queries and
 continues relevant store work before resolving the host delivery queue.
 
@@ -314,10 +385,8 @@ Bazaar subscription receipts with a genuinely empty/whitespace developer payload
 can use `store/subscriptions/recover`. This requires original signed evidence and
 backend ownership/linkage validation; unknown or other-account receipts must be
 rejected by the backend. A nonempty malformed or invalidly bound payload never
-falls back to this path. `enableSubscriptionRecoveryWithoutPayload` defaults to
-true. Set it to false in `InappifyOptions` to disable discovery and polling of
-those operations without deleting their checkpoints. Myket and bound receipts
-keep their own validated paths.
+falls back to this path. Recovery remains enabled internally without an extra
+Configure option. Myket and bound receipts keep their own validated paths.
 
 ## Observe state and control networking
 
@@ -330,10 +399,9 @@ client alive.
 
 `setNetworkEnabled(false)` stops SDK network use while retaining verified cache.
 Cache getters can still expose usable state; this switch is not a payment success
-or logout. Enable networking and invoke `recover()` when appropriate. Configure
-can restore verified persistent state, then reuse or renew its session. The
-separate `restoreCachedSession` extension is unsupported by the production
-client; it is not a cache-only startup API for this release.
+or logout. Reenabling networking checks the automatic recovery condition;
+use `syncStorePurchases()` when an immediate purchase-check result is needed. Configure
+can restore verified persistent state, then reuse or renew its session.
 
 ## Handle failures and diagnostics
 
@@ -347,8 +415,14 @@ callback can run on a background thread. For routine diagnostics record method,
 endpoint, status, duration, error category and SDK version. Do not add an OkHttp
 logger that prints session tokens, raw receipts, customer IDs or payment URLs.
 
-For discount codes, call `validateDiscountCode` and inspect `isValid` separately
+For discount codes, call `client.getDiscountedPaymentLinks("SAVE20")` and inspect `isValid` separately
 from SDK-call success. A successful response can be an invalid code. The current
 purchase method rejects a request-level `discountCode` or nonzero `discount`;
 validation is not an instruction to pass those overrides into purchase. See
 [the API reference](API_REFERENCE.md) for exact request fields and errors.
+
+The result retains its existing `InappifyDiscountCodeResult` fields, including
+`paymentLinks` with Offering identifiers and checkout URLs. Choose the appropriate
+link and open it using the normal payment URL allowlist checks. Database/server
+errors are SDK failures, not invalid-code results. Existing purchase and cache
+behavior is unchanged.

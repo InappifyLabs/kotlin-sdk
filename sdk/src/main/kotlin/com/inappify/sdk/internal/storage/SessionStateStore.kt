@@ -3,6 +3,7 @@ package com.inappify.sdk.internal.storage
 internal class PersistedSession(
     internal val token: String?,
     internal val appUserIdentifier: String?,
+    /** Retired field retained only to read/write the existing encrypted cache schema. */
     internal val forceVersion: Long?,
     internal val appId: Long?,
     internal val storeInfo: String?,

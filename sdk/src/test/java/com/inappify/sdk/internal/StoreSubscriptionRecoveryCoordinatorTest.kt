@@ -202,7 +202,7 @@ class StoreSubscriptionRecoveryCoordinatorTest {
     )
 
     private fun context(enabled: Boolean = true, customer: String = "customer", token: String = "session") =
-        StoreV2Context("key", token, "app-key", customer, "com.example.app", 5L, "IR", "1.0.0", null,
+        StoreV2Context("key", token, "app-key", customer, "com.example.app", 5L, "IR", "1.0.0",
             "market-key", InappifyMarket.BAZAAR, subscriptionRecoveryEnabled = enabled)
 
     private companion object {
@@ -214,7 +214,7 @@ class StoreSubscriptionRecoveryCoordinatorTest {
             http, StoreBackendResponse(http == 200,
                 StorePurchaseState(status, null, null, deliveryId, 17L, 0L, null, null, false,
                     source = source, productIdentifier = product),
-                false, null, error, null), null,
+                error, null), null,
         )
     }
 }

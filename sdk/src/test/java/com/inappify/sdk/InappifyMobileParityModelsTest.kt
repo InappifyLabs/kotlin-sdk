@@ -9,22 +9,6 @@ import org.junit.Test
 class InappifyContractModelsTest {
 
     @Test
-    fun attributesRequest_defensivelyCopiesAndRedactsValues() {
-        val source = mutableListOf(InappifyAttribute(key = "language", value = "fa"))
-        val request = InappifyAttributesRequest(source, idempotencyKey = "operation-1")
-        source += InappifyAttribute(key = "theme", value = "dark")
-
-        assertEquals(1, request.attributes.size)
-        assertThrows(UnsupportedOperationException::class.java) {
-            (request.attributes as MutableList).add(
-                InappifyAttribute(key = "timezone", value = "Asia/Tehran"),
-            )
-        }
-        assertFalse(request.toString().contains("language"))
-        assertFalse(request.toString().contains("operation-1"))
-    }
-
-    @Test
     fun customAttributeValidation_matchesMobileRules() {
         assertTrue(InappifyAttribute(key = "language-code_2", value = "fa").isValidCustomAttribute())
         assertTrue(InappifyAttribute(key = "theme", value = null).isValidCustomAttribute())

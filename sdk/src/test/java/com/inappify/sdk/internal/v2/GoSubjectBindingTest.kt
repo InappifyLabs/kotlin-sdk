@@ -70,7 +70,7 @@ class GoSubjectBindingTest {
             assertEquals(publicId, sdk.snapshot.appUserIdentifier)
             assertEquals(publicId, sdk.snapshot.customerInfo!!.originalAppUserId)
             assertEquals(internalId, saved().string("customerSubject"))
-            assertTrue(sdk.refreshCustomerInfo() is InappifyResult.Success)
+            assertTrue(sdk.getCustomerInfo(InappifyCacheFetchPolicy.FETCH_CURRENT) is InappifyResult.Success)
             assertEquals(publicId, jsonObject(transport.requests.first().jsonBody).string("appUserIdentifier"))
             assertFalse(transport.requests.first().jsonBody.contains(internalId))
         }
@@ -82,7 +82,7 @@ class GoSubjectBindingTest {
             val before = sdk.snapshot
             val durable = store.value!!.customerInfoJson
             internalId = "91002"
-            val failure = error(sdk.refreshCustomerInfo())
+            val failure = error(sdk.getCustomerInfo(InappifyCacheFetchPolicy.FETCH_CURRENT))
             assertEquals("SCOPE_MISMATCH", failure.details["serverCode"])
             assertEquals("sub", failure.details["mismatchField"])
             assertEquals("verifiedSession", failure.details["expectedSource"])
@@ -102,7 +102,7 @@ class GoSubjectBindingTest {
             configure(sdk)
             val before = sdk.snapshot
             transport.handler = { transport.response(envelope(identity = "different_public_user_123")) }
-            val failure = error(sdk.refreshCustomerInfo())
+            val failure = error(sdk.getCustomerInfo(InappifyCacheFetchPolicy.FETCH_CURRENT))
             assertEquals("CUSTOMER_MISMATCH", failure.details["serverCode"])
             assertEquals("customer_info.originalAppUserId", failure.details["mismatchField"])
             assertEquals(before, sdk.snapshot)
@@ -121,7 +121,7 @@ class GoSubjectBindingTest {
                     transport.response(jsonObject("""{"status":false,"code":"SESSION_EXPIRED"}"""), 401)
                 } else original(req)
             }
-            assertTrue(sdk.refreshCustomerInfo() is InappifyResult.Success)
+            assertTrue(sdk.getCustomerInfo(InappifyCacheFetchPolicy.FETCH_CURRENT) is InappifyResult.Success)
             assertEquals(listOf("configure", "customerInfo", "configure", "customerInfo"), transport.requests.map { it.path })
             transport.requests.filter { it.path == "configure" }.forEach {
                 assertEquals(id, jsonObject(it.jsonBody).string("appUserIdentifier"))
@@ -137,7 +137,7 @@ class GoSubjectBindingTest {
             transport.handler = { req -> if (req.path == "customerInfo")
                 transport.response(jsonObject("""{"status":false,"code":"SESSION_EXPIRED"}"""), 401)
                 else transport.response(envelope(subject = "other-internal")) }
-            val failure = error(sdk.refreshCustomerInfo())
+            val failure = error(sdk.getCustomerInfo(InappifyCacheFetchPolicy.FETCH_CURRENT))
             assertEquals("sub", failure.details["mismatchField"])
             assertEquals("configure", failure.details["operation"])
             assertEquals(true, failure.details["outcomeMayHaveCommitted"])
@@ -156,7 +156,7 @@ class GoSubjectBindingTest {
             assertEquals(id, sdk.snapshot.appUserIdentifier)
             assertTrue(transport.requests.isEmpty())
             transport.handler = { transport.response(envelope(subject = "different-internal")) }
-            assertEquals("sub", error(sdk.refreshCustomerInfo()).details["mismatchField"])
+            assertEquals("sub", error(sdk.getCustomerInfo(InappifyCacheFetchPolicy.FETCH_CURRENT)).details["mismatchField"])
         }
     }
 
@@ -176,9 +176,9 @@ class GoSubjectBindingTest {
             assertEquals(publicId, sdk.snapshot.appUserIdentifier)
             assertTrue(transport.requests.isEmpty())
             transport.handler = { transport.response(envelope(subject = "different-internal")) }
-            assertEquals("sub", error(sdk.refreshCustomerInfo()).details["mismatchField"])
+            assertEquals("sub", error(sdk.getCustomerInfo(InappifyCacheFetchPolicy.FETCH_CURRENT)).details["mismatchField"])
             transport.handler = { transport.response(envelope(subject = publicId)) }
-            assertTrue(sdk.refreshCustomerInfo() is InappifyResult.Success)
+            assertTrue(sdk.getCustomerInfo(InappifyCacheFetchPolicy.FETCH_CURRENT) is InappifyResult.Success)
             assertEquals(publicId, saved().string("customerSubject"))
         }
     }
@@ -207,20 +207,20 @@ class GoSubjectBindingTest {
     @Test fun loginCanReplaceBindingOnlyForTheVerifiedRequestedPublicIdentity() = runBlocking {
         client().use { sdk ->
             configure(sdk)
-            sdk.refreshOfferings(); sdk.queueAttributes(mapOf("campaign" to "previous-owner"))
+            sdk.refreshOfferings(); sdk.enqueueAttributes(mapOf("campaign" to "previous-owner"))
             internalId = "91002"
             val target = "customer_new_identity_123"
-            assertTrue(sdk.login(InappifyLoginRequest(target)) is InappifyResult.Success)
+            assertTrue(sdk.logIn(target) is InappifyResult.Success)
             assertEquals(target, sdk.snapshot.appUserIdentifier)
             assertTrue(sdk.snapshot.isAuthenticated)
             assertEquals(internalId, saved().string("customerSubject"))
             assertNull(sdk.snapshot.offerings)
             val requestsBefore = transport.requests.size
-            assertTrue(sdk.flushAttributes() is InappifyResult.Success)
+            assertTrue(sdk.flushQueuedAttributes() is InappifyResult.Success)
             assertEquals(requestsBefore, transport.requests.size)
-            assertTrue(sdk.refreshCustomerInfo() is InappifyResult.Success)
+            assertTrue(sdk.getCustomerInfo(InappifyCacheFetchPolicy.FETCH_CURRENT) is InappifyResult.Success)
             internalId = "91001"
-            assertEquals("sub", error(sdk.refreshCustomerInfo()).details["mismatchField"])
+            assertEquals("sub", error(sdk.getCustomerInfo(InappifyCacheFetchPolicy.FETCH_CURRENT)).details["mismatchField"])
         }
     }
 
@@ -228,7 +228,7 @@ class GoSubjectBindingTest {
         client().use { sdk ->
             configure(sdk)
             transport.handler = { transport.response(envelope(identity = "wrong_public_identity_123", subject = "91002")) }
-            val failure = error(sdk.login(InappifyLoginRequest("requested_public_identity_123")))
+            val failure = error(sdk.logIn("requested_public_identity_123"))
             assertEquals("appUserId", failure.details["mismatchField"])
             assertEquals("login", failure.details["operation"])
             assertEquals(200, failure.details["httpStatus"])
@@ -245,15 +245,15 @@ class GoSubjectBindingTest {
         install()
         client().use { sdk ->
             assertTrue(sdk.configure(InappifyOptions(options.apiKey, publicId)) is InappifyResult.Success)
-            sdk.refreshOfferings(); sdk.queueAttributes(mapOf("campaign" to "previous-owner"))
+            sdk.refreshOfferings(); sdk.enqueueAttributes(mapOf("campaign" to "previous-owner"))
             val alias = publicId
             internalId = "91002"
-            assertTrue(sdk.login(InappifyLoginRequest(alias)) is InappifyResult.Success)
+            assertTrue(sdk.logIn(alias) is InappifyResult.Success)
             assertEquals(alias, sdk.snapshot.appUserIdentifier)
             assertEquals(internalId, saved().string("customerSubject"))
             assertNull(sdk.snapshot.offerings)
             val count = transport.requests.size
-            sdk.flushAttributes()
+            sdk.flushQueuedAttributes()
             assertEquals(count, transport.requests.size)
         }
     }
@@ -283,7 +283,7 @@ class GoSubjectBindingTest {
             assertTrue(sdk.configure(options) is InappifyResult.Success)
             assertEquals(publicId, sdk.snapshot.appUserIdentifier)
             assertEquals(internalId, saved().string("customerSubject"))
-            assertTrue(sdk.refreshCustomerInfo() is InappifyResult.Success)
+            assertTrue(sdk.getCustomerInfo(InappifyCacheFetchPolicy.FETCH_CURRENT) is InappifyResult.Success)
         }
     }
 
@@ -292,7 +292,7 @@ class GoSubjectBindingTest {
             configure(sdk)
             val before = sdk.snapshot
             store.failSave = true; internalId = "91002"
-            assertTrue(sdk.login(InappifyLoginRequest("requested_public_identity_123")) is InappifyResult.Failure)
+            assertTrue(sdk.logIn("requested_public_identity_123") is InappifyResult.Failure)
             assertEquals(before, sdk.snapshot)
             assertEquals("91001", saved().string("customerSubject"))
         }
@@ -303,11 +303,11 @@ class GoSubjectBindingTest {
             configure(sdk)
             val previous = publicId
             internalId = "91003"
-            assertTrue(sdk.logout() is InappifyResult.Success)
+            assertTrue(sdk.logOut() is InappifyResult.Success)
             assertNotEquals(previous, sdk.snapshot.appUserIdentifier)
             assertFalse(sdk.snapshot.isAuthenticated)
             assertEquals(internalId, saved().string("customerSubject"))
-            assertTrue(sdk.refreshCustomerInfo() is InappifyResult.Success)
+            assertTrue(sdk.getCustomerInfo(InappifyCacheFetchPolicy.FETCH_CURRENT) is InappifyResult.Success)
         }
     }
 
@@ -315,7 +315,7 @@ class GoSubjectBindingTest {
         client().use { sdk ->
             configure(sdk)
             transport.handler = { TransportResult.Failure(TransportFailureKind.NETWORK) }
-            assertTrue(sdk.logout() is InappifyResult.Failure)
+            assertTrue(sdk.logOut() is InappifyResult.Failure)
             assertTrue(sdk.isLogoutPending)
         }
         client().use { sdk ->

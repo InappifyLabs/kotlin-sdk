@@ -1,5 +1,7 @@
 package com.inappify.sdk.internal.v2
 
+import com.inappify.sdk.internal.InappifyLogger
+
 import com.google.gson.*
 import com.google.gson.stream.JsonReader
 import com.google.gson.stream.JsonToken
@@ -257,6 +259,7 @@ internal class GoApi(
         if (raw.toByteArray().size > 1024 * 1024) fail("VALIDATION", "BODY_TOO_LARGE")
         repeat(if (retry) 4 else 1) { attempt ->
             if (!enabled) fail("CONFIGURATION", "V2_DISABLED")
+            InappifyLogger.log(InappifyLogLevel.DEBUG) { "HTTP request: ${InappifyLogger.endpoint(endpoint)}; attempt ${attempt + 1}." }
             val response = transport.execute(HttpRequest(endpoint, raw,
                 method = if (endpoint == "public-keys") "GET" else "POST",
                 headers = buildMap {
@@ -267,6 +270,7 @@ internal class GoApi(
                     putAll(headers)
                 }))
             if (response is TransportResult.Failure) {
+                InappifyLogger.log(InappifyLogLevel.WARN) { "HTTP request failed: ${response.kind.name}." }
                 val category = when (response.kind) {
                     TransportFailureKind.TIMEOUT -> "TIMEOUT"
                     TransportFailureKind.NETWORK -> "NETWORK"
@@ -278,6 +282,9 @@ internal class GoApi(
                 fail(category, response.kind.name, category != "DECODING")
             }
             val http = (response as TransportResult.Response).response
+            InappifyLogger.log(if (http.statusCode >= 500) InappifyLogLevel.ERROR else if (http.statusCode >= 400) InappifyLogLevel.WARN else InappifyLogLevel.DEBUG) {
+                "HTTP response: ${InappifyLogger.endpoint(endpoint)}; status ${http.statusCode}."
+            }
             if (http.statusCode == 204 && endpoint == "attributes") return GoApiResponse(JsonObject(), null)
             if (http.statusCode in setOf(429, 500, 502, 503, 504) && retry && attempt < 3) {
                 sleep(retryDelay(attempt, http.headers)); return@repeat

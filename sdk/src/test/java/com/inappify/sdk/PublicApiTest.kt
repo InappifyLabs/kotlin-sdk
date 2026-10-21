@@ -1,6 +1,5 @@
 package com.inappify.sdk
 
-import android.app.Activity
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -13,12 +12,34 @@ import org.junit.Test
 class PublicApiTest {
 
     @Test
-    fun offeringsRetainsV1JvmConstructors() {
+    fun clientsDoNotExposeQueueOrManualMetadataControls() {
+        val removed = setOf("queueAttributes", "flushAttributes", "syncAttributes",
+            "deleteAttributes", "setTargetingContext", "login", "logout", "refreshCustomerInfo",
+            "updateAttributes", "setDisplayname", "checkEntitlement", "recover",
+            "syncPurchases", "restorePurchases")
+        for (type in listOf(InappifyClient::class.java, InappifyV2Client::class.java)) {
+            assertTrue(type.methods.none { it.name in removed })
+            assertTrue(type.methods.any { it.name == "syncStorePurchases" && it.parameterCount == 1 })
+            assertTrue(type.methods.filter { it.name == "setAttributes" }
+                .all { it.parameterTypes.first() == Map::class.java })
+            assertTrue(type.methods.filter { it.name == "purchase" }
+                .all { it.parameterTypes.first() == InappifyPurchaseParams::class.java })
+            assertTrue(type.methods.filter { it.name == "getCustomerInfo" }
+                .all { it.parameterTypes.first() == InappifyCacheFetchPolicy::class.java })
+            assertTrue(type.methods.filter { it.name == "getCurrentOffering" }
+                .all { it.parameterCount == 2 })
+        }
+        val storeMethods = Class.forName("com.inappify.sdk.InappifyStoreV2Kt").methods
+        assertTrue(storeMethods.any { it.name == "restoreStorePurchases" && it.parameterCount == 2 })
+        assertTrue(storeMethods.none { it.name == "restorePurchases" })
+    }
+
+    @Test
+    fun offeringsExposeCurrentConstructorsWithoutRetiredMetadata() {
         val type = InappifyOfferings::class.java
         assertEquals(InappifyOfferings(), type.getConstructor().newInstance())
-        type.getConstructor(List::class.java, List::class.java, java.lang.Long::class.java, String::class.java)
-        type.getConstructor(List::class.java, List::class.java, java.lang.Long::class.java, String::class.java,
-            Int::class.javaPrimitiveType, Class.forName("kotlin.jvm.internal.DefaultConstructorMarker"))
+        type.getConstructor(List::class.java, List::class.java, String::class.java)
+        assertTrue(type.constructors.none { java.lang.Long::class.java in it.parameterTypes })
     }
 
     @Test
@@ -26,35 +47,11 @@ class PublicApiTest {
         val rendered = InappifyOptions(
             apiKey = "public-api-key",
             appUserIdentifier = "09120000000",
-            market = InappifyMarket.BAZAAR,
-            marketKey = "market-public-key",
-            country = "IR",
-            appVersion = "1.0.0",
         ).toString()
 
         assertFalse(rendered.contains("public-api-key"))
         assertFalse(rendered.contains("09120000000"))
-        assertFalse(rendered.contains("market-public-key"))
         assertTrue(rendered.contains("<redacted>"))
-    }
-
-    @Test
-    fun loginRequestToString_redactsSensitiveValues() {
-        val rendered = InappifyLoginRequest(
-            appUserIdentifier = "09120000000",
-        ).toString()
-
-        assertFalse(rendered.contains("09120000000"))
-    }
-
-    @Test
-    fun loginRequestRetainsPublishedConstructorWithoutRequiringAnAppKey() {
-        val type = InappifyLoginRequest::class.java
-        val current = type.getConstructor(String::class.java).newInstance("customer")
-        val legacy = type.getConstructor(String::class.java, String::class.java)
-            .newInstance("unused-old-key", "customer")
-        assertEquals(current.appUserIdentifier, legacy.appUserIdentifier)
-        assertFalse(legacy.toString().contains("unused-old-key"))
     }
 
     @Test
@@ -76,7 +73,7 @@ class PublicApiTest {
             "InappifySnapshot(revision=0, isConfigured=false, " +
                 "isAuthenticated=false, appUserIdentifier=null, market=null, " +
                 "country=null, appVersion=null, sdkVersion=test, storeInfo=null, " +
-                "forceVersion=1, appId=null, hasCustomerInfo=false, " +
+                "appId=null, hasCustomerInfo=false, " +
                 "offeringsCount=0, failedToLoadCustomerInfo=false, " +
                 "failedToLoadOfferings=false)",
             snapshot.toString(),
@@ -381,7 +378,7 @@ class PublicApiTest {
     fun storeV2Extensions_keepCustomV1ClientsCompatible() = runBlocking {
         val client: InappifyClient = FakeClient()
 
-        val restored = client.restorePurchases()
+        val restored = client.restoreStorePurchases()
             as InappifyResult.Success<InappifyRestoreResult>
         val confirmation = client.confirmDelivery(42L) as InappifyResult.Failure
 
@@ -392,16 +389,6 @@ class PublicApiTest {
             confirmation.error.code,
         )
         assertSame(client.snapshot, confirmation.snapshot)
-    }
-
-    @Test
-    fun cacheRestoreExtensionKeepsCustomV1ClientsCompatibleWithoutNetworkFallback() = runBlocking {
-        val client: InappifyClient = FakeClient()
-        val result = client.restoreCachedSession(InappifyOptions("test-key")) as InappifyResult.Failure
-        assertEquals(InappifyErrorCode.UNSUPPORTED_OPERATION, result.error.code)
-        assertSame(client.snapshot, result.snapshot)
-        assertEquals(0L, client.snapshot.revision)
-        assertFalse(InappifyClient::class.java.declaredMethods.any { it.name == "restoreCachedSession" })
     }
 
     @Test
@@ -448,70 +435,40 @@ class PublicApiTest {
             options: InappifyOptions,
         ): InappifyResult<Unit> = InappifyResult.Success(Unit, snapshot)
 
-        override suspend fun login(
-            request: InappifyLoginRequest,
+        override suspend fun logIn(
+            appUserIdentifier: String,
         ): InappifyResult<Unit> = InappifyResult.Success(Unit, snapshot)
 
-        override suspend fun logout(): InappifyResult<Unit> =
+        override suspend fun logOut(): InappifyResult<Unit> =
             InappifyResult.Success(Unit, snapshot)
 
         override suspend fun getCustomerInfo(
-            forceRefresh: Boolean,
+            fetchPolicy: InappifyCacheFetchPolicy,
         ): InappifyResult<InappifyCustomerInfo> =
             InappifyResult.Success(InappifyCustomerInfo(), snapshot)
-
-        override suspend fun refreshCustomerInfo(): InappifyResult<InappifyCustomerInfo> =
-            getCustomerInfo()
 
         override suspend fun getOfferings(): InappifyResult<InappifyOfferings> =
             InappifyResult.Success(InappifyOfferings(), snapshot)
 
-        override suspend fun refreshOfferings(): InappifyResult<InappifyOfferings> =
-            getOfferings()
-
-        override suspend fun validateDiscountCode(
-            request: InappifyDiscountCodeRequest,
+        override suspend fun getDiscountedPaymentLinks(
+            discountCode: String,
         ): InappifyResult<InappifyDiscountCodeResult> = InappifyResult.Success(
             InappifyDiscountCodeResult(),
             snapshot,
         )
 
-        override suspend fun setTargetingContext(
-            country: String?,
-            appVersion: String?,
-        ): InappifyResult<Unit> = InappifyResult.Success(Unit, snapshot)
-
         override suspend fun getCurrentOffering(
             placementIdentifier: String?,
-            forceRefresh: Boolean,
-            context: InappifyOfferingEvaluationContext?,
         ): InappifyResult<InappifyOffering?> = InappifyResult.Success(null, snapshot)
 
-        override suspend fun checkEntitlement(
-            identifier: String,
-            forceRefresh: Boolean,
-        ): InappifyResult<Boolean> = InappifyResult.Success(false, snapshot)
-
         override suspend fun setAttributes(
-            request: InappifyAttributesRequest,
+            attributes: Map<String, String?>,
         ): InappifyResult<List<InappifyAttribute>> =
-            InappifyResult.Success(request.attributes, snapshot)
-
-        override suspend fun deleteAttributes(
-            request: InappifyDeleteAttributesRequest,
-        ): InappifyResult<List<InappifyAttribute>> =
-            InappifyResult.Success(emptyList(), snapshot)
+            InappifyResult.Success(attributes.map { InappifyAttribute(it.key, it.value) }, snapshot)
 
         override suspend fun setReservedAttribute(
             request: InappifyReservedAttributeRequest,
         ): InappifyResult<Unit> = InappifyResult.Success(Unit, snapshot)
-
-        override suspend fun syncAttributes(
-            request: InappifyAttributesRequest?,
-        ): InappifyResult<List<InappifyAttribute>> = InappifyResult.Success(
-            request?.attributes.orEmpty(),
-            snapshot,
-        )
 
         override suspend fun canSetReservedAttribute(
             key: String,
@@ -521,12 +478,7 @@ class PublicApiTest {
         )
 
         override suspend fun purchase(
-            request: InappifyPurchaseRequest,
-        ): InappifyResult<InappifyPurchase> = unsupportedPurchase()
-
-        override suspend fun purchase(
-            activity: Activity,
-            request: InappifyPurchaseRequest,
+            purchaseParams: InappifyPurchaseParams,
         ): InappifyResult<InappifyPurchase> = unsupportedPurchase()
 
         private fun unsupportedPurchase(): InappifyResult<InappifyPurchase> =
@@ -538,7 +490,7 @@ class PublicApiTest {
                 snapshot,
             )
 
-        override suspend fun syncPurchases(): InappifyResult<List<InappifyPurchase>> =
+        override suspend fun syncStorePurchases(): InappifyResult<List<InappifyPurchase>> =
             InappifyResult.Success(emptyList(), snapshot)
 
         override fun addEventListener(

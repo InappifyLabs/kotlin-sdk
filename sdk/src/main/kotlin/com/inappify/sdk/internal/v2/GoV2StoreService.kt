@@ -76,7 +76,7 @@ internal class GoV2StoreService(
                 source = state.text("source"),
                 productIdentifier = state.text("productIdentifier"),
                 alreadyDelivered = state.bool("alreadyDelivered"),
-            ), false, null, null, null), null, response.retryAfterSeconds)
+            ), null, null), null, response.retryAfterSeconds)
         } catch (failure: V2Failure) {
             val details = failure.sdkError.details
             val status = details["httpStatus"] as? Int
@@ -85,7 +85,7 @@ internal class GoV2StoreService(
                 "NETWORK" -> ServiceFailureKind.NETWORK
                 "DECODING" -> ServiceFailureKind.MALFORMED_RESPONSE
                 else -> ServiceFailureKind.UNKNOWN
-            }) else StoreServiceResult.Response(status, StoreBackendResponse(false, null, false, null,
+            }) else StoreServiceResult.Response(status, StoreBackendResponse(false, null,
                 details["serverCode"] as? String, null), null, details["retryAfterSeconds"] as? Long)
         } catch (cancelled: CancellationException) {
             throw cancelled

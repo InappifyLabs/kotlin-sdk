@@ -1,34 +1,20 @@
 package com.inappify.sdk
 
-import org.junit.Assert.assertFalse
-import org.junit.Assert.assertTrue
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Test
 
 class InappifyOptionsTest {
     @Test
-    fun subscriptionRecoveryIsEnabledByDefault() {
-        assertTrue(InappifyOptions(apiKey = "public-fixture-key").enableSubscriptionRecoveryWithoutPayload)
-    }
+    fun configureAcceptsOnlyAnAppKeyAndOptionalCustomerIdentity() {
+        val anonymous = InappifyOptions(apiKey = "public-fixture-key")
+        assertNull(anonymous.appUserIdentifier)
+        val identified = InappifyOptions("public-fixture-key", "customer-123")
+        assertEquals("customer-123", identified.appUserIdentifier)
 
-    @Test
-    fun subscriptionRecoveryRetainsExplicitConfiguration() {
-        assertFalse(InappifyOptions(
-            apiKey = "public-fixture-key",
-            enableSubscriptionRecoveryWithoutPayload = false,
-        ).enableSubscriptionRecoveryWithoutPayload)
-        assertTrue(InappifyOptions(
-            apiKey = "public-fixture-key",
-            enableSubscriptionRecoveryWithoutPayload = true,
-        ).enableSubscriptionRecoveryWithoutPayload)
-    }
-
-    @Test
-    fun originalOptionsJvmConstructorEnablesSubscriptionRecovery() {
-        val options = InappifyOptions::class.java.getConstructor(
-            String::class.java, String::class.java, InappifyMarket::class.java,
-            String::class.java, String::class.java, String::class.java,
-        ).newInstance("public-fixture-key", null, null, null, null, null)
-
-        assertTrue(options.enableSubscriptionRecoveryWithoutPayload)
+        val constructor = InappifyOptions::class.java.constructors.single { !it.isSynthetic }
+        assertEquals(listOf(String::class.java, String::class.java), constructor.parameterTypes.toList())
+        assertEquals(setOf("getApiKey", "getAppUserIdentifier", "toString"),
+            InappifyOptions::class.java.declaredMethods.map { it.name }.toSet())
     }
 }

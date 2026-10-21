@@ -54,19 +54,19 @@ Production persistence uses AES-GCM encrypted files in the application's no-back
 
 Session-cache fingerprints bind the app key, application package and SDK service configuration. Verified app/project and customer scope are checked before cache publication. Marketplace journals additionally bind the commerce endpoint, app/package, account and store. An operation from another scope is not silently replayed for the current customer. Changing app configuration requires a new client; retain only checkpoints that belong to their original scope.
 
-`configure(options)` loads and verifies matching persisted state. When the retained session remains usable, Configure can complete from that state and schedule background recovery. The separate `restoreCachedSession(options)` extension is not implemented by the production V2 client and returns `UNSUPPORTED_OPERATION`; use Configure and the V2 fetch policies.
+`configure(options)` loads and verifies matching persisted state. When the retained session remains usable, Configure can complete from that state and schedule background recovery. Use Configure and the V2 fetch policies; there is no separate local-session restoration API.
 
 `customerInfo(policy)` and `offerings(policy)` support `CACHE_ONLY`, `CACHE_FIRST`, `NETWORK_FIRST`, and `NETWORK_ONLY`. `CACHE_FIRST` can return available verified cache immediately and schedule a background refresh. `NETWORK_FIRST` can fall back to retained cache after a network failure. The current production implementation does not impose a five-minute limit on `CACHE_FIRST`.
 
 Cached CustomerInfo is signature- and scope-checked, but an expired signed envelope may be retained for offline use. Cached data is not proof of current server authorization. The production client's `getEntitlement` / `isActiveEntitlement` helpers also check the entitlement's expiry against the trusted time floor learned from signed server data. Design the application's offline access policy explicitly; do not grant a new purchase because an HTTP call failed.
 
-A pending logout or login transition hides the previous customer's public state and blocks normal session work until reconciliation completes. Keep the host account lifecycle aligned with the SDK and call `recover()` after foregrounding, reconnecting or returning from checkout. `setNetworkEnabled(false)` prevents subsequent SDK/commerce HTTP use while retaining verified cache. It is not a device firewall, a store-disconnect API or an automatic cancellation of every already-running operation.
+A pending logout or login transition hides the previous customer's public state and blocks normal session work until reconciliation completes. Keep the host account lifecycle aligned with the SDK. Internal recovery observes foreground/reconnect and marked checkout returns automatically. `setNetworkEnabled(false)` prevents subsequent SDK/commerce HTTP use while retaining verified cache. It is not a device firewall, a store-disconnect API or an automatic cancellation of every already-running operation.
 
 The public snapshot and state events contain no session credentials or purchase tokens. They can still contain customer identifiers and business data. Their `toString()` redaction does not make manually serializing their properties appropriate for unrestricted logs.
 
 ## Attribute privacy
 
-V2 attributes are write-only values. The client removes attributes from verified public CustomerInfo rather than returning stored personal values. `queueAttributes()` persists valid writes in the encrypted account-bound document; `flushAttributes()` sends queued batches with the session Bearer. Null or empty values request deletion. Rejected batches can remain quarantined locally for recovery analysis, so collecting a value has persistence implications even when the server rejects it.
+V2 attributes are write-only values. The client removes attributes from verified public CustomerInfo rather than returning stored personal values. `setAttributes()` persists valid writes in the encrypted account-bound document, then sends queued batches internally with the session Bearer. Null or empty values request deletion. Failed network sends retain the pending queue; rejected batches can remain quarantined locally for recovery analysis, so collecting a value has persistence implications even when the server rejects it.
 
 Do not put session credentials, store receipts or application secrets in attributes. Select custom and reserved attributes according to your application's privacy policy, and avoid duplicating their values in analytics or logs. Queue and synchronize targeting attributes before fetching a targeted offering; returned public CustomerInfo is not an attribute readback API.
 
@@ -78,11 +78,11 @@ For a manual flow, first commit the same durable, idempotent host grant, then ca
 
 Recovery persists checkpoints before registration or acknowledgement and retains retry/backoff state. It can resume an acknowledgement whose server result was lost without calling the host grant again. The host must still make its own inventory transaction idempotent: a process can stop after the host grant and before an SDK checkpoint completes.
 
-When an error includes `outcomeMayHaveCommitted`, retain the logical purchase attempt and call `recover()` / `syncPendingConsumables()` rather than opening another store payment. A native success callback is receipt evidence, not an immediate entitlement grant. Refresh verified customer state and inspect the server-authoritative purchase/delivery status. Do not clear app data or edit the encrypted journal to work around a pending payment.
+When an error includes `outcomeMayHaveCommitted`, retain the logical purchase attempt and use `syncStorePurchases()` / `syncPendingConsumables()` for a manual check, or allow automatic recovery to resume it, rather than opening another store payment. A native success callback is receipt evidence, not an immediate entitlement grant. Refresh verified customer state and inspect the server-authoritative purchase/delivery status. Do not clear app data or edit the encrypted journal to work around a pending payment.
 
 ## Bazaar subscriptions with an empty payload
 
-`enableSubscriptionRecoveryWithoutPayload` defaults to `true` in `InappifyOptions`. It allows an owned Bazaar subscription whose developer payload is empty or whitespace to use:
+Subscription recovery remains enabled internally without a Configure option. It allows an owned Bazaar subscription whose developer payload is empty or whitespace to use:
 
 ```text
 POST https://api.inappify.com/app/v2/store/subscriptions/recover
@@ -93,7 +93,7 @@ Only the Bazaar subscription inventory query qualifies. The receipt must match t
 
 The backend must deploy the recovery endpoint and validate the receipt with Bazaar, establish a link to a previously verified purchase, prove ownership for the current session, and resolve the catalog subscription. Session possession, SKU and a client purchase timestamp alone do not prove ownership or a new billing period. Both recovery and verification-status responses must identify the matching source and product; consumable delivery/consumption states are rejected for this subscription operation.
 
-For an explicit opt-out, construct `InappifyOptions` with `enableSubscriptionRecoveryWithoutPayload = false`. This prevents discovery and polling of these operations without deleting pending checkpoints. Local deduplication compares the token hash and purchase time with freshly verified CustomerInfo. If both stay unchanged, automatic recovery can skip the receipt; authoritative renewal/expiry detection still belongs to the backend. Keep pending operation data intact across SDK upgrades and do not downgrade to a client that cannot decode its operation kind.
+Local deduplication compares the token hash and purchase time with freshly verified CustomerInfo. If both stay unchanged, automatic recovery can skip the receipt; authoritative renewal/expiry detection still belongs to the backend. Keep pending operation data intact across SDK upgrades and do not downgrade to a client that cannot decode its operation kind.
 
 ## Opt-in HTTP diagnostics
 
@@ -155,3 +155,32 @@ A successful Configure, compilation or synthetic test does not establish that a 
 - [Encrypted state](../sdk/src/main/kotlin/com/inappify/sdk/internal/storage/EncryptedSessionStateStore.kt), [durable fulfillment API](../sdk/src/main/kotlin/com/inappify/sdk/InappifyConsumableFulfillment.kt)
 
 See [Getting started](GETTING_STARTED.md), [API reference](API_REFERENCE.md), [Store setup](STORES.md), and [Recovery and cache](RECOVERY_AND_CACHE.md) for integration details.
+
+## SDK log levels and custom handling
+
+`InappifyClient.logLevel` and `InappifyClient.logHandler` are process-wide and can
+be set before Configure. Defaults are DEBUG in development and INFO in release;
+explicit settings take precedence when the client is created. There are five
+levels: VERBOSE, DEBUG, INFO, WARN and ERROR. The chosen level is the minimum
+severity delivered. The default handler uses Android Logcat with `[Inappify]`.
+
+```kotlin
+InappifyClient.logLevel = InappifyLogLevel.DEBUG
+InappifyClient.logHandler = object : InappifyLogHandler {
+    override fun v(tag: String, msg: String) { /* verbose */ }
+    override fun d(tag: String, msg: String) { /* debug */ }
+    override fun i(tag: String, msg: String) { /* info */ }
+    override fun w(tag: String, msg: String) { /* warning */ }
+    override fun e(tag: String, msg: String, throwable: Throwable?) { /* error */ }
+}
+// Restore the default console handler when finished.
+InappifyClient.logHandler = DefaultInappifyLogHandler()
+```
+
+Callbacks run on the emitting thread and should return promptly. Throwing or
+recursive handlers cannot change SDK results. Standard messages contain only
+structural events, enum status codes and redacted endpoint names; API keys,
+customer identifiers, attribute values, tokens, signed envelopes and receipts
+are not printed at any level. VERBOSE does not enable raw HTTP logging.
+Logging performs no network upload and adds no persisted cache/journal state.
+Existing filtered HTTP traces remain independently opt-in.

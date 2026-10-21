@@ -6,21 +6,19 @@ import com.inappify.sdk.internal.domain.InappifyOfferingResolver
 public class InappifyOfferings private constructor(
     offerings: List<InappifyOffering>?,
     rules: List<InappifyRule>?,
-    public val forceVersion: Long?,
     public val fetchedAt: String?,
     public val currentOfferingIdentifier: String?,
     placements: Map<String, String?>?,
     public val usesServerTargeting: Boolean,
 ) {
 
-    /** Original V1 constructor, including its default-argument JVM ABI. */
+    /** Creates a collection without retired update-enforcement metadata. */
     @JvmOverloads
     public constructor(
         offerings: List<InappifyOffering>? = null,
         rules: List<InappifyRule>? = null,
-        forceVersion: Long? = null,
         fetchedAt: String? = null,
-    ) : this(offerings, rules, forceVersion, fetchedAt, null, null, false)
+    ) : this(offerings, rules, fetchedAt, null, null, false)
 
     /** Go v2 placement mapping; null values deliberately fall back to current/default. */
     public val placements: Map<String, String?>? = placements?.let {
@@ -29,6 +27,34 @@ public class InappifyOfferings private constructor(
 
     /** Defensive, unmodifiable copy of all available offerings. */
     public val offerings: List<InappifyOffering>? = immutableList(offerings)
+
+    /** Read-only identifier lookup over the existing collection; never fetches or changes cache. */
+    public val all: Map<String, InappifyOffering>
+        get() = java.util.Collections.unmodifiableMap(
+            LinkedHashMap<String, InappifyOffering>().apply {
+                offerings.orEmpty().forEach { offering ->
+                    offering.identifier?.let { identifier ->
+                        if (!containsKey(identifier)) put(identifier, offering)
+                    }
+                }
+            },
+        )
+
+    /** Server-selected offering, falling back to the existing catalog default. */
+    public val current: InappifyOffering?
+        get() = currentOfferingIdentifier?.let(::getOffering)
+            ?: offerings?.firstOrNull { it.isDefault == true }
+
+    /** Exact identifier lookup; missing identifiers return null without a default fallback. */
+    public fun getOffering(identifier: String): InappifyOffering? =
+        offerings?.firstOrNull { it.identifier == identifier }
+
+    /** Equivalent to [getOffering]. */
+    public operator fun get(identifier: String): InappifyOffering? = getOffering(identifier)
+
+    /** Preserves Go selection: placement, then current, then catalog default, including null mappings. */
+    public fun getCurrentOfferingForPlacement(placementId: String): InappifyOffering? =
+        placements?.get(placementId)?.let(::getOffering) ?: current
 
     /** Defensive, unmodifiable copy of ordered targeting rules. */
     public val rules: List<InappifyRule>? = immutableList(rules)
@@ -96,7 +122,6 @@ public class InappifyOfferings private constructor(
         "InappifyOfferings(" +
             "offerings=${offerings.redactedCollection()}, " +
             "rules=${rules.redactedCollection()}, " +
-            "forceVersion=$forceVersion, " +
             "fetchedAt=$fetchedAt" +
             ")"
 
@@ -104,14 +129,12 @@ public class InappifyOfferings private constructor(
         other is InappifyOfferings &&
             offerings == other.offerings &&
             rules == other.rules &&
-            forceVersion == other.forceVersion &&
             fetchedAt == other.fetchedAt && currentOfferingIdentifier == other.currentOfferingIdentifier &&
             placements == other.placements && usesServerTargeting == other.usesServerTargeting
 
     public override fun hashCode(): Int {
         var result = offerings?.hashCode() ?: 0
         result = 31 * result + (rules?.hashCode() ?: 0)
-        result = 31 * result + (forceVersion?.hashCode() ?: 0)
         result = 31 * result + (fetchedAt?.hashCode() ?: 0)
         if (usesServerTargeting) {
             result = 31 * result + (currentOfferingIdentifier?.hashCode() ?: 0)
@@ -121,9 +144,9 @@ public class InappifyOfferings private constructor(
     }
 
     internal companion object {
-        internal fun serverTargeted(offerings: List<InappifyOffering>?, forceVersion: Long?,
+        internal fun serverTargeted(offerings: List<InappifyOffering>?,
             fetchedAt: String?, current: String?, placements: Map<String, String?>?): InappifyOfferings =
-            InappifyOfferings(offerings, null, forceVersion, fetchedAt, current, placements, true)
+            InappifyOfferings(offerings, null, fetchedAt, current, placements, true)
     }
 }
 
@@ -142,7 +165,13 @@ public class InappifyOffering public constructor(
     public val metadata: Any? = immutableJsonValue(metadata)
 
     /** Defensive, unmodifiable copy of packages in this offering. */
-    public val packages: List<InappifyPackage>? = immutableList(packages)
+    public val packages: List<InappifyPackage>? = immutableList(
+        packages?.map { it.withOfferingIdentifier(identifier) },
+    )
+
+    /** Non-null view of the same package collection; does not add a serialized field. */
+    public val availablePackages: List<InappifyPackage>
+        get() = packages.orEmpty()
 
     /** Deeply immutable opaque paywall payload. */
     public val paywall: Map<String, Any?>? = immutableJsonMap(paywall)
@@ -182,15 +211,35 @@ public class InappifyOffering public constructor(
 }
 
 /** Immutable purchasable package associated with an offering. */
-public class InappifyPackage public constructor(
-    public val identifier: String? = null,
-    public val packageType: Long? = null,
-    public val description: String? = null,
-    public val entitlement: String? = null,
-    public val name: String? = null,
-    public val discountPercent: Long? = null,
-    public val product: InappifyStoreProduct? = null,
+public class InappifyPackage private constructor(
+    public val identifier: String?,
+    public val packageType: Long?,
+    public val description: String?,
+    public val entitlement: String?,
+    public val name: String?,
+    public val discountPercent: Long?,
+    public val product: InappifyStoreProduct?,
+    /** Parent catalog context, reconstructed from the offering and never stored as a package wire field. */
+    @Transient public val offeringIdentifier: String?,
+    @Suppress("UNUSED_PARAMETER") constructorMarker: Unit,
 ) {
+
+    /** Original constructor and its default-argument JVM ABI remain available. */
+    @JvmOverloads
+    public constructor(
+        identifier: String? = null,
+        packageType: Long? = null,
+        description: String? = null,
+        entitlement: String? = null,
+        name: String? = null,
+        discountPercent: Long? = null,
+        product: InappifyStoreProduct? = null,
+    ) : this(identifier, packageType, description, entitlement, name, discountPercent, product, null, Unit)
+
+    internal fun withOfferingIdentifier(identifier: String?): InappifyPackage =
+        if (offeringIdentifier == identifier) this else InappifyPackage(
+            this.identifier, packageType, description, entitlement, name, discountPercent, product, identifier, Unit,
+        )
 
     public override fun toString(): String =
         "InappifyPackage(" +
@@ -226,13 +275,36 @@ public class InappifyPackage public constructor(
 }
 
 /** Immutable store product referenced by an offering package. */
-public class InappifyStoreProduct public constructor(
-    public val identifier: String? = null,
-    public val name: String? = null,
-    prices: List<InappifyPrice>? = null,
-    public val dollarPrice: Double? = null,
-    public val trialDays: Long? = null,
+public class InappifyStoreProduct private constructor(
+    public val identifier: String?,
+    public val name: String?,
+    prices: List<InappifyPrice>?,
+    public val dollarPrice: Double?,
+    public val trialDays: Long?,
+    /** Server catalog classification; missing or unrecognized metadata remains null. */
+    public val productType: InappifyProductType?,
+    @Suppress("UNUSED_PARAMETER") constructorMarker: Unit,
 ) {
+
+    /** Original constructor and its default-argument JVM ABI remain available. */
+    @JvmOverloads
+    public constructor(
+        identifier: String? = null,
+        name: String? = null,
+        prices: List<InappifyPrice>? = null,
+        dollarPrice: Double? = null,
+        trialDays: Long? = null,
+    ) : this(identifier, name, prices, dollarPrice, trialDays, null, Unit)
+
+    /** Adds product classification without changing the existing constructor. */
+    public constructor(
+        identifier: String? = null,
+        name: String? = null,
+        prices: List<InappifyPrice>? = null,
+        dollarPrice: Double? = null,
+        trialDays: Long? = null,
+        productType: InappifyProductType?,
+    ) : this(identifier, name, prices, dollarPrice, trialDays, productType, Unit)
 
     /** Defensive, unmodifiable copy of localized product prices. */
     public val prices: List<InappifyPrice>? = immutableList(prices)
@@ -252,7 +324,8 @@ public class InappifyStoreProduct public constructor(
             name == other.name &&
             prices == other.prices &&
             dollarPrice == other.dollarPrice &&
-            trialDays == other.trialDays
+            trialDays == other.trialDays &&
+            productType == other.productType
 
     public override fun hashCode(): Int {
         var result = identifier?.hashCode() ?: 0
@@ -260,6 +333,7 @@ public class InappifyStoreProduct public constructor(
         result = 31 * result + (prices?.hashCode() ?: 0)
         result = 31 * result + (dollarPrice?.hashCode() ?: 0)
         result = 31 * result + (trialDays?.hashCode() ?: 0)
+        if (productType != null) result = 31 * result + productType.hashCode()
         return result
     }
 }

@@ -1,7 +1,6 @@
 package com.inappify.sdk.internal
 
 import android.os.SystemClock
-import android.util.Log
 import com.inappify.sdk.InappifyError
 import com.inappify.sdk.InappifyErrorCode
 import com.inappify.sdk.InappifyOfferings
@@ -12,7 +11,7 @@ import java.util.ArrayDeque
 /** Owned by one client and accessed only under that client's operation mutex. */
 internal class TargetingSyncRateLimiter(
     private val elapsedMillis: () -> Long = SystemClock::elapsedRealtime,
-    private val warn: (String) -> Unit = { Log.w("Inappify", it); Unit },
+    private val warn: (String) -> Unit = { message -> InappifyLogger.log(com.inappify.sdk.InappifyLogLevel.WARN) { message } },
 ) {
     private val starts = ArrayDeque<Long>()
     private var lastNow = Long.MIN_VALUE

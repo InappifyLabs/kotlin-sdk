@@ -81,6 +81,161 @@ class GoCommerceRegressionTest(private val nativeMarket: InappifyMarket) {
         }
     }
 
+    private fun installTypedCatalog(type: String) {
+        val original = sdkTransport.handler
+        sdkTransport.handler = { request -> if (request.path == "offerings")
+            sdkTransport.response(jsonObject("""{"status":true,"offerings":[
+                {"identifier":"first","packages":[{"identifier":"package","product":{
+                    "identifier":"product","productType":"$type"}}]},
+                {"identifier":"original","packages":[{"identifier":"package","product":{
+                    "identifier":"product","productType":"$type"}}]}]}""")) else original(request) }
+    }
+
+    private fun successfulReceipt(request: StorePurchaseRequest): StoreBillingResult =
+        StoreBillingResult.Success(StorePurchase("fixture-order", "fixture-token", request.developerPayload!!,
+            "com.example.mobile", "product", signing.now, "fixture-json", "fixture-signature"))
+
+    @Test fun packagePurchaseUsesExactParentAndTheExistingStoreReceiptContract() = runBlocking {
+        freshPurchase = { request ->
+            assertEquals(StoreProductType.IN_APP, request.productType)
+            val payload = jsonObject(request.developerPayload!!)
+            assertEquals("original", payload.string("offeringIdentifier"))
+            assertEquals("package", payload.string("nativePackageIdentifier"))
+            assertEquals("NON_CONSUMABLE", payload.string("productType"))
+            successfulReceipt(request)
+        }
+        client().use { sdk ->
+            installTypedCatalog("NON_CONSUMABLE")
+            configured(sdk)
+            val selected = sdk.snapshot.offerings!!["original"]!!.availablePackages.single()
+            val result = sdk.purchase(InappifyPurchaseParams.Builder(android.app.Activity(), selected)
+                .idempotencyKey("package-attempt").build())
+            assertTrue(result.toString(), result is InappifyResult.Success)
+            assertEquals(nativeMarket, (result as InappifyResult.Success).data.market)
+            assertEquals("package-attempt", result.data.attemptId)
+            assertEquals("fixture-public-rsa", billingKey)
+            val submitted = commerceTransport.requests.single()
+            assertEquals("store/purchases", submitted.path)
+            assertEquals("Bearer go-session-token", submitted.headers["Authorization"])
+            val body = jsonObject(submitted.jsonBody)
+            assertEquals(setOf("productIdentifier", "offeringIdentifier", "operation", "purchase"), body.keySet())
+            assertEquals("original", body.string("offeringIdentifier"))
+            assertEquals("fixture-token", body.getAsJsonObject("purchase").string("token"))
+            assertEquals(1, billingCalls)
+            assertTrue(storage.operations.isEmpty())
+        }
+    }
+
+    @Test fun packageSubscriptionUsesBazaarSubscriptionBillingAndPreservesMyketRejection() = runBlocking {
+        freshPurchase = { request ->
+            assertEquals(StoreProductType.SUBSCRIPTION, request.productType)
+            successfulReceipt(request)
+        }
+        client().use { sdk ->
+            installTypedCatalog("SUBSCRIPTION")
+            configured(sdk)
+            val selected = sdk.snapshot.offerings!!["original"]!!.availablePackages.single()
+            val result = sdk.purchase(InappifyPurchaseParams.Builder(android.app.Activity(), selected).build())
+            if (nativeMarket == InappifyMarket.MYKET) {
+                assertEquals("MYKET_SUBSCRIPTIONS_UNSUPPORTED",
+                    (result as InappifyResult.Failure).error.details["serverCode"])
+                assertEquals(0, billingCalls)
+                assertTrue(commerceTransport.requests.isEmpty())
+            } else {
+                assertTrue(result.toString(), result is InappifyResult.Success)
+                assertEquals(1, billingCalls)
+                assertEquals("store/purchases", commerceTransport.requests.single().path)
+            }
+        }
+    }
+
+    @Test fun packageConsumableRetainsDeliveryCheckpointUntilHostGrant() = runBlocking {
+        freshPurchase = ::successfulReceipt
+        client().use { sdk ->
+            installTypedCatalog("CONSUMABLE")
+            configured(sdk)
+            commerceTransport.handler = { commerceTransport.response(jsonObject(
+                """{"status":true,"data":{"purchase":{"status":"DELIVERY_REQUIRED","deliveryId":7}}}""")) }
+            val selected = sdk.snapshot.offerings!!["original"]!!.availablePackages.single()
+            val result = sdk.purchase(InappifyPurchaseParams.Builder(android.app.Activity(), selected)
+                .idempotencyKey("delivery-attempt").build()) as InappifyResult.Success
+            assertEquals(7L, result.data.deliveryId)
+            assertNull(result.data.purchaseStatus)
+            assertEquals(PendingStoreProductType.CONSUMABLE, storage.operations.single().productType)
+            assertEquals(PendingStoreOperationPhase.DELIVERY_REQUIRED, storage.operations.single().phase)
+            assertFalse(storage.operations.single().deliveryAcknowledged)
+            assertEquals(listOf("store/purchases"), commerceTransport.requests.map { it.path })
+        }
+    }
+
+    @Test fun packagePurchaseCancellationDoesNotRegisterPaymentOrRewriteCache() = runBlocking {
+        freshPurchase = { StoreBillingResult.Cancelled }
+        client().use { sdk ->
+            installTypedCatalog("NON_CONSUMABLE")
+            configured(sdk)
+            val before = storage.value
+            val selected = sdk.snapshot.offerings!!["original"]!!.availablePackages.single()
+            val result = sdk.purchase(InappifyPurchaseParams.Builder(android.app.Activity(), selected).build())
+                as InappifyResult.Failure
+            assertEquals(InappifyErrorCode.PURCHASE_CANCELLED, result.error.code)
+            assertTrue(commerceTransport.requests.isEmpty())
+            assertTrue(storage.operations.isEmpty())
+            assertSame(before, storage.value)
+        }
+    }
+
+    @Test fun incompletePackageMetadataNeverOpensStoreOrChangesExistingCache() = runBlocking {
+        client().use { sdk ->
+            configured(sdk) // Existing catalogs without productType remain readable.
+            val selected = sdk.snapshot.offerings!!["original"]!!.availablePackages.single()
+            val before = storage.value
+            val count = sdkTransport.requests.size
+            val result = sdk.purchase(InappifyPurchaseParams.Builder(android.app.Activity(), selected).build())
+                as InappifyResult.Failure
+            assertEquals("PRODUCT_TYPE_REQUIRED", result.error.details["serverCode"])
+            assertSame(sdk.snapshot, result.snapshot)
+            assertSame(before, storage.value)
+            assertEquals(count, sdkTransport.requests.size)
+            assertEquals(0, billingCalls)
+            assertTrue(commerceTransport.requests.isEmpty())
+        }
+    }
+
+    @Test fun packageParamsResumePaidAttemptWithoutActivityAfterCatalogInvalidation() = runBlocking {
+        client().use { sdk ->
+            installTypedCatalog("CONSUMABLE")
+            configured(sdk)
+            val selected = sdk.snapshot.offerings!!["original"]!!.availablePackages.single()
+            val params = InappifyPurchaseParams.Builder(selected).idempotencyKey("attempt-1").build()
+            storage.upsertPendingStoreOperation(pending())
+            assertTrue(sdk.enqueueAttributes(mapOf("audience" to "changed")) is InappifyResult.Success)
+            assertNull(sdk.snapshot.offerings)
+            val result = sdk.purchase(params) as InappifyResult.Success
+            assertEquals(InappifyStorePurchaseStatus.DELIVERY_REQUIRED, result.data.storePurchaseStatus)
+            assertEquals("attempt-1", result.data.attemptId)
+            assertEquals(0, billingCalls)
+        }
+    }
+
+    @Test fun packageParamsPreserveNativeHostAndDirectOnlyOptionValidation() = runBlocking {
+        client().use { sdk ->
+            installTypedCatalog("NON_CONSUMABLE")
+            configured(sdk)
+            val selected = sdk.snapshot.offerings!!["original"]!!.availablePackages.single()
+            val missingHost = sdk.purchase(InappifyPurchaseParams.Builder(selected).build()) as InappifyResult.Failure
+            assertEquals("STORE_UI_HOST_REQUIRED", missingHost.error.details["serverCode"])
+            val attribution = sdk.purchase(InappifyPurchaseParams.Builder(android.app.Activity(), selected)
+                .paywallAttribution(4, 2).build()) as InappifyResult.Failure
+            assertEquals("PURCHASE_OVERRIDE_NOT_ALLOWED", attribution.error.details["serverCode"])
+            // Retain the old request's rejection contract for existing SDK consumers.
+            val legacyCrypto = sdk.purchase(android.app.Activity(), InappifyPurchaseRequest("product", "original",
+                isCrypto = true, productType = InappifyProductType.NON_CONSUMABLE)) as InappifyResult.Failure
+            assertEquals("PURCHASE_OVERRIDE_NOT_ALLOWED", legacyCrypto.error.details["serverCode"])
+            assertEquals(0, billingCalls)
+            assertTrue(commerceTransport.requests.isEmpty())
+        }
+    }
+
     private suspend fun configured(sdk: GoV2Client) {
         assertTrue(sdk.configure(InappifyOptions("public-fixture-key", signing.subject)) is InappifyResult.Success)
         assertTrue(sdk.refreshOfferings() is InappifyResult.Success)
@@ -114,7 +269,7 @@ class GoCommerceRegressionTest(private val nativeMarket: InappifyMarket) {
                 productType = InappifyProductType.CONSUMABLE)) as InappifyResult.Failure
             assertEquals("PURCHASE_ATTEMPT_CONFLICT", retry.error.details["serverCode"])
             assertTrue(sdk.confirmDelivery(7) is InappifyResult.Failure)
-            assertTrue((sdk.syncPurchases() as InappifyResult.Success).data.isEmpty())
+            assertTrue((sdk.syncStorePurchases() as InappifyResult.Success).data.isEmpty())
             assertTrue(commerceTransport.requests.isEmpty())
             assertEquals(1, storage.operations.size)
         }
@@ -150,7 +305,7 @@ class GoCommerceRegressionTest(private val nativeMarket: InappifyMarket) {
             assertEquals("PURCHASE_ATTEMPT_CONFLICT", retry.error.details["serverCode"])
             val confirm = sdk.confirmDelivery(7) as InappifyResult.Failure
             assertEquals("DELIVERY_NOT_FOUND", confirm.error.details["serverCode"])
-            val sync = sdk.syncPurchases() as InappifyResult.Success
+            val sync = sdk.syncStorePurchases() as InappifyResult.Success
             assertTrue(sync.data.isEmpty())
             assertTrue(commerceTransport.requests.isEmpty())
             assertEquals(originalOperation, storage.operations.single())
@@ -171,6 +326,26 @@ class GoCommerceRegressionTest(private val nativeMarket: InappifyMarket) {
             assertTrue(commerceTransport.requests.isEmpty())
         }
     }
+    @Test fun serverBillingKeySurvivesCachedRestartWithoutConfigureRequest() = runBlocking {
+        client().use { sdk -> configured(sdk) }
+        val savedSession = jsonObject(storage.value!!.customerInfoJson!!).getAsJsonObject("session")
+        assertEquals("fixture-public-rsa", savedSession.string("storeInfo"))
+        sdkTransport.requests.clear()
+
+        client().use { restarted ->
+            val handler = sdkTransport.handler
+            sdkTransport.handler = { request ->
+                check(request.path != "configure") { "The valid cached session must be reused." }
+                handler(request)
+            }
+            assertTrue(restarted.configure(InappifyOptions("public-fixture-key", signing.subject))
+                is InappifyResult.Success)
+            assertTrue(sdkTransport.requests.isEmpty())
+            assertTrue(restarted.syncStorePurchases() is InappifyResult.Success)
+            assertEquals("fixture-public-rsa", billingKey)
+            assertTrue(sdkTransport.requests.none { it.path == "configure" })
+        }
+    }
     @Test fun retryCannotChangeProductTypeOfAnExistingAttempt() = runBlocking {
         client().use { sdk ->
             configured(sdk)
@@ -182,11 +357,11 @@ class GoCommerceRegressionTest(private val nativeMarket: InappifyMarket) {
             assertEquals(PendingStoreProductType.CONSUMABLE, storage.operations.single().productType)
         }
     }
-    @Test fun paidAttemptResumesAfterConfigureInvalidatesCatalogAndLegacyTypeWasClassified() = runBlocking {
+    @Test fun paidAttemptResumesAfterAttributeInvalidationAndLegacyTypeWasClassified() = runBlocking {
         client().use { sdk ->
             configured(sdk)
             storage.upsertPendingStoreOperation(pending())
-            assertTrue(sdk.configure(InappifyOptions("public-fixture-key", signing.subject, country = "US"))
+            assertTrue(sdk.enqueueAttributes(mapOf("audience" to "changed"))
                 is InappifyResult.Success)
             assertNull(sdk.snapshot.offerings)
             val result = sdk.purchase(InappifyPurchaseRequest("product", "original", idempotencyKey = "attempt-1"))
@@ -210,7 +385,7 @@ class GoCommerceRegressionTest(private val nativeMarket: InappifyMarket) {
             configured(sdk)
             storage.upsertPendingStoreOperation(pending())
             sdk.setNetworkEnabled(false)
-            assertTrue(sdk.syncPurchases() is InappifyResult.Failure)
+            assertTrue(sdk.syncStorePurchases() is InappifyResult.Failure)
             assertTrue(sdk.confirmDelivery(7) is InappifyResult.Failure)
             assertEquals(0, billingCalls)
             assertTrue(commerceTransport.requests.isEmpty())
@@ -236,7 +411,7 @@ class GoCommerceRegressionTest(private val nativeMarket: InappifyMarket) {
         client().use { sdk ->
             configured(sdk)
             owned[StoreProductType.IN_APP] = listOf(receipt())
-            val result = sdk.syncPurchases()
+            val result = sdk.syncStorePurchases()
             assertTrue(result is InappifyResult.Success)
             val purchase = (result as InappifyResult.Success).data.single()
             assertEquals("original", purchase.offeringIdentifier)
@@ -254,7 +429,7 @@ class GoCommerceRegressionTest(private val nativeMarket: InappifyMarket) {
             configured(sdk)
             for (invalid in listOf(receipt(offering = ""), receipt(product = "other"))) {
                 owned[StoreProductType.IN_APP] = listOf(invalid)
-                assertTrue(sdk.syncPurchases() is InappifyResult.Success)
+                assertTrue(sdk.syncStorePurchases() is InappifyResult.Success)
             }
             assertTrue(commerceTransport.requests.isEmpty())
             assertTrue(storage.operations.isEmpty())
@@ -264,10 +439,10 @@ class GoCommerceRegressionTest(private val nativeMarket: InappifyMarket) {
         client().use { sdk ->
             configured(sdk)
             owned[StoreProductType.IN_APP] = listOf(receipt(offering = "previous-offering"))
-            assertTrue(sdk.configure(InappifyOptions("public-fixture-key", signing.subject, country = "US"))
+            assertTrue(sdk.enqueueAttributes(mapOf("audience" to "changed"))
                 is InappifyResult.Success)
             assertNull(sdk.snapshot.offerings)
-            assertTrue(sdk.syncPurchases() is InappifyResult.Success)
+            assertTrue(sdk.syncStorePurchases() is InappifyResult.Success)
             assertEquals("previous-offering", jsonObject(commerceTransport.requests.single().jsonBody)
                 .string("offeringIdentifier"))
         }
@@ -276,7 +451,7 @@ class GoCommerceRegressionTest(private val nativeMarket: InappifyMarket) {
         client().use { sdk ->
             configured(sdk)
             owned[StoreProductType.SUBSCRIPTION] = listOf(receipt(type = "CONSUMABLE"))
-            assertTrue(sdk.syncPurchases() is InappifyResult.Success)
+            assertTrue(sdk.syncStorePurchases() is InappifyResult.Success)
             assertTrue(commerceTransport.requests.isEmpty())
         }
     }
@@ -289,7 +464,7 @@ class GoCommerceRegressionTest(private val nativeMarket: InappifyMarket) {
             owned[StoreProductType.IN_APP] = listOf(first, other)
             commerceTransport.handler = { commerceTransport.response(jsonObject(
                 """{"status":true,"data":{"purchase":{"status":"DELIVERY_REQUIRED","deliveryId":7}}}""")) }
-            assertTrue(sdk.syncPurchases() is InappifyResult.Success)
+            assertTrue(sdk.syncStorePurchases() is InappifyResult.Success)
             assertEquals(1, commerceTransport.requests.size)
             assertEquals("fixture-store-token", storage.operations.single().evidence.purchaseToken)
         }
@@ -298,7 +473,7 @@ class GoCommerceRegressionTest(private val nativeMarket: InappifyMarket) {
         client().use { sdk ->
             configured(sdk)
             owned[StoreProductType.IN_APP] = listOf(receipt(type = "CONSUMABLE"))
-            assertTrue(sdk.restorePurchases() is InappifyResult.Success)
+            assertTrue(sdk.restoreStorePurchases() is InappifyResult.Success)
             assertTrue(commerceTransport.requests.isEmpty())
         }
     }

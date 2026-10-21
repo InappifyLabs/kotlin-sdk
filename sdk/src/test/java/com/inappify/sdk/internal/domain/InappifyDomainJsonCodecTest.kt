@@ -157,7 +157,7 @@ class InappifyDomainJsonCodecTest {
 
         assertTrue(offering?.isDefault == true)
         assertEquals("Main plan", offering?.serverDescription)
-        assertEquals(17L, offerings.forceVersion)
+        assertFalse(InappifyDomainJsonCodec.encodeOfferings(offerings).contains("forceVersion"))
         assertEquals(42L, price?.appProductId)
         assertEquals(129.5, price?.amount)
         assertEquals(150L, price?.originalAmount)
@@ -212,7 +212,7 @@ class InappifyDomainJsonCodecTest {
         val rule = offerings.rules?.single()
         val condition = rule?.conditions?.single()
 
-        assertEquals(17L, offerings.forceVersion)
+        assertFalse(InappifyDomainJsonCodec.encodeOfferings(offerings).contains("forceVersion"))
         assertEquals(7L, offering?.trialDays)
         assertEquals(1L, nestedPackage?.packageType)
         assertEquals(-10L, nestedPackage?.discountPercent)
@@ -255,7 +255,7 @@ class InappifyDomainJsonCodecTest {
 
         assertEquals(-2_147_483_649L, customer.transactions?.single()?.status)
         assertEquals(5_000_000_000L, customer.transactions?.single()?.amount)
-        assertEquals(2_147_483_648L, offerings.forceVersion)
+        assertFalse(InappifyDomainJsonCodec.encodeOfferings(offerings).contains("forceVersion"))
         val offering = offerings.offerings?.single()
         val nestedPackage = offering?.packages?.single()
         val price = nestedPackage?.product?.prices?.single()

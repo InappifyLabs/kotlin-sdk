@@ -314,8 +314,6 @@ class StoreV2CoordinatorTest(private val market: InappifyMarket) {
             payload = StoreBackendResponse(
                 status = false,
                 state = null,
-                hasForceUpdate = false,
-                forceVersion = null,
                 errorCode = "INVALID_${pending.evidence.purchaseToken}",
                 message = "Unsafe ${currentContext.customerToken}\nmessage",
             ),
@@ -344,8 +342,6 @@ class StoreV2CoordinatorTest(private val market: InappifyMarket) {
                 payload = StoreBackendResponse(
                     status = false,
                     state = null,
-                    hasForceUpdate = false,
-                    forceVersion = null,
                     errorCode = "UNKNOWN_STORE_FAILURE",
                     message = "The request could not be completed.",
                 ),
@@ -974,7 +970,6 @@ class StoreV2CoordinatorTest(private val market: InappifyMarket) {
         appId = APP_ID,
         country = "IR",
         appVersion = "1.0.0",
-        forceVersion = null,
         marketKey = marketKey,
         market = market,
     )
@@ -1030,8 +1025,6 @@ class StoreV2CoordinatorTest(private val market: InappifyMarket) {
                 message = message,
                 alreadyProcessed = false,
             ),
-            hasForceUpdate = false,
-            forceVersion = null,
             errorCode = null,
             message = null,
         ),

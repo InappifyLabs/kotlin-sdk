@@ -1,7 +1,7 @@
 # Kotlin API reference
 
-Artifact: `com.github.InappifyLabs:kotlin-sdk:v0.1.1`.
-SDK-reported version: `0.1.1`, without the
+Artifact: `com.github.InappifyLabs:kotlin-sdk:v0.2.0`.
+SDK-reported version: `0.2.0`, without the
 Git tag prefix. Configure, snapshots and targeting use that exact value; local
 version normalization does not alter production server offering selection. Public types and extension functions live in
 `com.inappify.sdk`; import individual symbols or `com.inappify.sdk.*`.
@@ -31,16 +31,8 @@ Inappify integration.
 | --- | --- | --- |
 | `apiKey` | required `String` | App public key for session bootstrap/renewal; nonblank, at most 4096 characters, no controls |
 | `appUserIdentifier` | `String? = null` | Current host customer; omission may retain an existing customer, otherwise create an anonymous identity |
-| `market` | `InappifyMarket? = null` | Store/key context; cannot replace the server-selected purchase route |
-| `marketKey` | `String? = null` | App public RSA key for the selected store; storeInfo in the verified session can supply it when absent |
-| `country` | `String? = null` | Two-letter targeting country, normalized uppercase; retained value or IR supplies the production default |
-| `appVersion` | `String? = null` | Targeting version; default Android versionName; nonblank and at most 50 characters |
-| `enableSubscriptionRecoveryWithoutPayload` | `Boolean = true` | Bazaar-only empty-payload subscription workflow; constructor option with private setter |
 
-The constructor with the Boolean parameter supports explicit opt-out. False
-prevents discovery/submission and polling for those pending recovery operations,
-while preserving stored evidence. It does not relax binding checks or disable
-ordinary bound store recovery. See [recovery](GETTING_STARTED.md#restore-and-automatic-recovery).
+Configure accepts only the app API key and optional customer identity. Store routing and the RSA public key come from the server session. Android package metadata supplies versionName/versionCode; country resolution and subscription recovery retain their internal defaults.
 
 `InappifyMarket` values are `BAZAAR`, `MYKET`, and `NONE`. Verified session
 `storePlatform` values for supported Android routes are `Bazar`, `MyKet`, and
@@ -49,22 +41,24 @@ ordinary bound store recovery. See [recovery](GETTING_STARTED.md#restore-and-aut
 | Method | Result | Production behavior |
 | --- | --- | --- |
 | `configure(options)` | `InappifyResult<Unit>` | Verify/load app-bound cache, resolve identity, reuse or establish a verified session, schedule background recovery |
-| `login(InappifyLoginRequest(appUserIdentifier))` | `InappifyResult<Unit>` | Transition from the current session to a custom customer; HTTP uses the session Bearer |
-| `logout()` | `InappifyResult<Unit>` | Complete the durable logout transition and create an anonymous session |
+| `logIn(appUserIdentifier: String)` | `InappifyResult<Unit>` | Transition from the current session to a custom customer; HTTP uses the session Bearer |
+| `logOut()` | `InappifyResult<Unit>` | Complete the durable logout transition and create an anonymous session |
 | `isCustomerAnonymous(appUserIdentifier)` | `Boolean` | Client helper recognizes valid SDK anonymous identifiers |
-| `recover()` | `InappifyResult<Unit>` | Reconcile pending identity transition, customer state, store/delivery work and offerings |
+| `handleDeepLink(url: String)` | `Boolean` | Recognize/queue a marked InAppify native payment return; ignore ordinary/invalid/other-app links; does not report payment success |
 | `setNetworkEnabled(enabled)` | `Unit` | Enable/disable SDK network use without deleting cache |
+
+Foreground, restored internet and reenabling SDK networking check for unfinished
+current-customer purchases or five minutes since successful recovery. Automatic
+recovery waits at least thirty seconds after failure. These client-lifetime
+timestamps do not change persisted cache, purchase journals or server requests.
 
 Custom identity is 1–100 Unicode code points, with no controls, edge whitespace,
 malformed Unicode or reserved anonymous prefix. Login does not accept an anonymous
-identity as its target. `InappifyLoginRequest` needs only the customer identifier;
-the configured session is authoritative. The former two-argument constructor is
-deprecated and ignores its app-key argument. Changing the app key/service
+identity as its target. `logIn` takes only the customer identifier;
+the configured session is authoritative. Changing the app key/service
 binding requires a new client. `isLogoutPending` exposes the logout barrier.
 
-The `restoreCachedSession(options): InappifyResult<Boolean>` extension is exported
-but returns `UNSUPPORTED_OPERATION` for the production factory client. Use
-Configure to load/reuse its verified cache; do not assume a network-free Configure.
+Use Configure to load/reuse verified cache; do not assume a network-free Configure.
 Standalone `isCustomerAnonymous(String?)` is a broader string helper and can treat
 null as anonymous; prefer the client helper for an actual SDK identity.
 
@@ -72,10 +66,8 @@ null as anonymous; prefer the client helper for an actual SDK identity.
 
 | Method | Result/behavior |
 | --- | --- |
-| `getCustomerInfo(forceRefresh = true)` | `InappifyResult<InappifyCustomerInfo>`; true uses NETWORK_ONLY, false uses CACHE_FIRST |
-| `refreshCustomerInfo()` | Same result, NETWORK_ONLY |
+| `getCustomerInfo(fetchPolicy = CACHED_OR_FETCHED)` | `InappifyResult<InappifyCustomerInfo>`; see the four CustomerInfo policies below |
 | `customerInfo(policy)` | Explicit cache/network policy |
-| `checkEntitlement(identifier, forceRefresh = true)` | `InappifyResult<Boolean>`; refreshes customer state by default |
 | `isActiveEntitlement(identifier)` | Synchronous Boolean from latest snapshot |
 | `hasEntitlement(identifier)` | Alias of `isActiveEntitlement` |
 | `getEntitlement(identifier)` | Active `InappifyEntitlement?` from latest snapshot |
@@ -83,12 +75,17 @@ null as anonymous; prefer the client helper for an actual SDK identity.
 Production entitlement checks require `isActive == true`. A supplied nonblank
 expiration must parse and lie in the future according to the client's trusted
 time; expired/malformed values do not authorize access. These helpers do not grant
-consumable inventory. CustomerInfo extension helpers also exist for operating on
-a model directly; the client methods are the authoritative integration path.
+consumable inventory. Check `entitlements.active` on a verified `getCustomerInfo`
+result, or use the synchronous client helpers for the latest snapshot. To wait for
+the server first, use `getCustomerInfo(InappifyCacheFetchPolicy.FETCH_CURRENT)`.
 
 `InappifyCustomerInfo` fields: `originalAppUserId`, `firstSeen`, `requestDate`,
 `latestExpirationDate`, `hasUsedTrial`, `entitlements`, `transactions`, `attributes`.
-Collections and optional server values may be null. An entitlement contains
+`entitlements` is a non-null `InappifyEntitlementInfos`: `all` contains known active,
+expired and inactive rights; `active` filters rights using the trusted clock at
+access time; `[identifier]` looks up any known right. Both maps are read-only.
+Existing list operations remain supported. Transactions, attributes and optional
+server values may be null. An entitlement contains
 `identifier`, `isActive`, `isSandbox`, `periodType`, `purchaseDate`, `expirationDate`,
 `ownershipType`, `entitlementType`, `purchaseStoreRefHash`, `purchaseStoreTime`.
 Store time is epoch milliseconds, not seconds. `InappifyTransaction` summarizes
@@ -97,34 +94,78 @@ it is not a purchase token. `InappifyAttribute` contains nullable `key` and `val
 
 ### Fetch policy
 
+`getCustomerInfo` uses `InappifyCacheFetchPolicy`:
+
+| Value | Behavior |
+| --- | --- |
+| `CACHE_ONLY` | Return verified cache or CACHE_MISS; never fetch |
+| `FETCH_CURRENT` | Wait for the server and return any failure without a stale fallback |
+| `NOT_STALE_CACHED_OR_CURRENT` | Return fresh cache, otherwise wait for the server; no stale fallback on error |
+| `CACHED_OR_FETCHED` (default) | Return available cache immediately, refresh if stale; wait for the server when cache is absent |
+
+CustomerInfo becomes stale after five minutes in the foreground or twenty-five
+hours in the background. Reads, foreground transitions and restored connectivity
+can trigger refresh; there is no polling timer. The existing persisted
+`infoFetchedAt` timestamp is reused across restarts. Requests share the existing
+customer flight and signature/session validation. Failed refreshes retain the
+verified cache. Purchase and recovery paths still force their required refreshes.
+
+```kotlin
+when (val result = client.getCustomerInfo()) {
+    is InappifyResult.Success -> {
+        val activePro = result.data.entitlements.active["pro"]
+        val knownPro = result.data.entitlements["pro"] // may be inactive
+    }
+    is InappifyResult.Failure -> { /* Show/retry the error when no cache exists. */ }
+}
+val current = client.getCustomerInfo(InappifyCacheFetchPolicy.FETCH_CURRENT)
+```
+
+Go V2 returns one selected record per entitlement identifier, including inactive
+history. Active grants take priority over expired/revoked records. Its wire
+`entitlements` remains an array inside signed CustomerInfo; existing disk cache
+formats do not change. V1 remains active-only.
+
 `InappifyFetchPolicy` applies to `customerInfo` and `offerings`:
 
 | Value | Behavior |
 | --- | --- |
 | `CACHE_ONLY` | Return usable current cache or a CACHE_MISS failure; no resource HTTP |
-| `CACHE_FIRST` | Return cache immediately when present; schedule background refresh; otherwise request network |
+| `CACHE_FIRST` | Return cache immediately; CustomerInfo schedules its existing refresh, Offerings uses foreground/freshness checks; otherwise request network |
 | `NETWORK_FIRST` | Request network and fall back to the retained resource if the request fails and cache remains available |
 | `NETWORK_ONLY` | Request network and surface failure without a resource-cache fallback |
 
 Cache belongs to the configured app/customer/targeting context. A cached success
-does not prove a new payment finished, and no fixed five-minute freshness promise
-is imposed by these production getters. Inspect snapshots/events for later refresh.
+does not prove a new payment finished. Offerings have a five-minute automatic
+refresh threshold and thirty-second failure backoff, both held only in runtime
+memory. Automatic prefetch/refresh starts only while the app is foreground;
+cached data returns immediately. A disk-restored catalog is usable immediately
+and gets one foreground validation. The advanced `customerInfo(policy)` method
+retains its previous behavior; new integrations should use `getCustomerInfo`.
+Explicit network policies and admitted targeting-sync calls bypass this automatic
+schedule. Inspect snapshots/events for later refresh.
 
 ## Offerings and targeting
 
 | Method | Result/behavior |
 | --- | --- |
 | `getOfferings()` | `InappifyResult<InappifyOfferings>` using CACHE_FIRST |
-| `refreshOfferings()` | Same result using NETWORK_ONLY |
+| `getOffering(identifier)` | `InappifyResult<InappifyOffering?>`; exact identifier via the normal cache/fetch flow; missing ID is a successful null |
 | `offerings(policy)` | Explicit cache policy |
-| `getCurrentOffering(placementIdentifier = null, forceRefresh = false, context = null)` | `InappifyResult<InappifyOffering?>`; placement → server current → catalog default |
-| `setTargetingContext(country = null, appVersion = null)` | `InappifyResult<Unit>`; change non-null fields and invalidate offerings |
+| `getCurrentOffering(placementIdentifier = null)` | `InappifyResult<InappifyOffering?>`; normal cache/fetch flow, then placement → server current → catalog default |
 | `syncAttributesAndOfferingsIfNeeded()` | Upload queued attributes and fetch fresh offerings, subject to the per-client limiter |
 
-The production client does not evaluate downloaded targeting rules or use the
-optional `context` parameter to override the server's decision. Offerings requests
+For manual refresh, await `syncAttributesAndOfferingsIfNeeded()`, then select
+from its returned collection or call `getCurrentOffering(placementIdentifier)`.
+`getCurrentOffering` follows `getOfferings()` caching and has no `forceRefresh`
+parameter. Automatic refresh retains its independent freshness and retry policy.
+
+The production client does not evaluate downloaded targeting rules or expose a
+local context override for the server's decision. Offerings requests
 send appVersion, SDK version, country and supported paywall schema/renderer
-versions using the current verified session. They flush queued attributes first.
+versions using the current verified session. Country and app version are supplied
+automatically by the SDK; there is no public metadata override. Requests flush
+queued attributes first.
 `InappifyOfferingEvaluationContext(country, platform, appVersion, sdkVersion = "",
 appId = null, customAttributes = emptyMap())` is available for model-level helpers;
 creating it does not change the production session.
@@ -135,8 +176,15 @@ and return current-session cached offerings, or `UNKNOWN` with details
 `reason = RATE_LIMITED_NO_CACHE` and `retryAfterMillis` if no cache exists. Login
 and logout do not reset the limit; other APIs are not governed by this local limit.
 
-`InappifyOfferings` exposes `offerings`, `rules`, `forceVersion`, `fetchedAt`,
+`InappifyOfferings` exposes `offerings`, `rules`, `fetchedAt`,
 `currentOfferingIdentifier`, `placements`, and `usesServerTargeting`.
+It also exposes read-only `all: Map<String, InappifyOffering>` and `current`,
+exact `getOffering(identifier)` / `[identifier]` lookups, and
+`getCurrentOfferingForPlacement(placementId)`. These navigate the existing
+collection without network requests or cache writes. Current selects the server's
+identifier then the catalog default; placement selection falls back to Current,
+including unknown and explicit null placement mappings. An unknown Offering ID
+returns null instead of substituting Current. This preserves the Go contract.
 Production resources preserve server targeting and omit rule/force-update inputs.
 `defaultOffering()` returns the first default and can throw when a non-null
 collection has no default; `getCurrentOffering()` safely supports null selection.
@@ -147,32 +195,34 @@ for server-targeted models. `evaluateField`, `evaluateOperator` and
 Model navigation:
 
 - `InappifyOffering`: nullable identifier, default flag, description, trialDays,
-  opaque metadata, packages and opaque paywall document.
+  opaque metadata, packages and opaque paywall document. `availablePackages` is
+  a non-null read-only view of `packages`, empty when packages are absent.
 - `InappifyPackage`: nullable identifier, packageType, description, entitlement,
-  name, discountPercent and product.
-- `InappifyStoreProduct`: nullable identifier/name, prices, dollarPrice and trialDays.
+  name, discountPercent, product and reconstructed parent `offeringIdentifier`.
+- `InappifyStoreProduct`: nullable identifier/name, prices, dollarPrice, trialDays
+  and server-supplied `productType`.
 - `InappifyPrice`: currency and monetary/catalog fields; `price`, `originPrice`
   and IDs are nullable Long, while amount/originalAmount/discountAmount are Number.
 - `InappifyRule`, `InappifyCondition`, `InappifyPlacement` and
   `InappifyPlacementOffering` represent model-level rule/placement structures.
 
-Opaque metadata/paywalls are deeply immutable JSON-compatible values. Catalog
-models do not expose a public product-type classification; the host supplies the
-correct configured SKU type when purchasing.
+Opaque metadata/paywalls are deeply immutable JSON-compatible values. Product
+classification comes from Go V2; missing or unknown values remain null. The
+package-based purchase API does not infer classification from package period.
 
 ## Attributes and discounts
 
 | Method | Result/behavior |
 | --- | --- |
-| `queueAttributes(values: Map<String, String?>)` | `InappifyResult<Unit>`; durably enqueue write-only changes and invalidate offerings |
-| `flushAttributes()` | `InappifyResult<Unit>`; upload queued batches |
-| `setAttributes(InappifyAttributesRequest(attributes, idempotencyKey = null))` | Queue then flush; success returns an empty `List<InappifyAttribute>` |
-| `updateAttributes(values)` | Map convenience for setAttributes |
-| `deleteAttributes(InappifyDeleteAttributesRequest(keys))` | Enqueue removals and flush |
-| `syncAttributes(request = null)` | Flush existing queue; with a request, queue then flush; no attribute download |
+| `setAttributes(attributes: Map<String, String?>)` | Same validation, durable queue and flush; success returns an empty `List<InappifyAttribute>` |
 | `setReservedAttribute(InappifyReservedAttributeRequest(attribute, value))` | `InappifyResult<Unit>` through the same queue/validation |
 | `canSetReservedAttribute(key)` | `InappifyResult<Boolean>` for an exact supported backend key |
-| `validateDiscountCode(InappifyDiscountCodeRequest(discountCode, offeringIdentifier = null))` | `InappifyResult<InappifyDiscountCodeResult>` |
+| `getDiscountedPaymentLinks(discountCode: String)` | `InappifyResult<InappifyDiscountCodeResult>`; checks the code and returns eligible web payment links |
+
+Use `setAttributes(mapOf("key" to null))` or an empty-string value to delete
+attributes. `setAttributes` owns the durable enqueue-and-flush flow; callers do
+not manage a separate queue. Failed network sends retain pending writes for the
+existing internal retry flow or `syncAttributesAndOfferingsIfNeeded()`.
 
 Custom keys match `[A-Za-z][A-Za-z0-9_-]{0,39}`. Values are null or at most
 500 Unicode code points. Null or the empty string removes a value; whitespace
@@ -180,55 +230,84 @@ is a value, not a deletion marker. Invalid input fails the call instead of being
 silently dropped. The durable queue allows at most 1000 distinct keys; uploads
 use batches of up to 50. A definitive HTTP 422 quarantines the rejected batch.
 Attributes are write-only through these APIs; do not expect them to appear in
-CustomerInfo or a setter's returned list. `idempotencyKey` in the attribute request
-is not sent by the current endpoint.
+CustomerInfo or a setter's returned list.
+
+The server contract remains `POST /app/v2/attributes` with session Bearer
+authentication and JSON `{ "attributes": { "key": "value", "removed": null } }`.
+Each upload contains 1–50 entries; the server returns HTTP 204 on success and
+enforces a maximum of 50 custom attributes per customer.
 
 Supported reserved backend keys are `$email`, `$displayName`, `$apnsTokens`,
-`$fcmTokens`, `$idfa`, `$idfv`, `$phoneNumber`, `$campaign`, `$keyword`.
+`$fcmTokens`, `$idfa`, `$idfv`, `$ip`, `$phoneNumber`, `$campaign`, `$keyword`.
 Convenience functions are `setEmail`, `setDisplayName`, `setApnsToken`,
-`setFcmToken`, `setIdfa`, `setIdfv`, `setPhoneNumber`, `setCampaign`, `setKeyword`.
-The enum also exposes `IP` and the client exposes `setIp`, but `$ip` is not in the
-production supported-key set and its setter fails validation. Query capability
-with the exact backend key. `setDisplayname` is a deprecated alias; use
-`setDisplayName`.
+`setFcmToken`, `setIdfa`, `setIdfv`, `setIp`, `setPhoneNumber`, `setCampaign`, `setKeyword`.
+`setIp(value)` writes the supplied IP attribute through the normal queue; it does
+not collect or download an IP. An empty string clears it. Query capability with
+the exact backend key. Use `setDisplayName` for the display-name attribute.
 
-Discount validation sends only `code` in the current session; its
-`offeringIdentifier` constructor field is not sent. SDK success is distinct from
-`data.isValid`. The result can contain `errorCode`, code/discount IDs, percent,
-message, paymentLinks and an offering. Each `InappifyPurchaseLink` has offering
-and URL. Payment URLs must pass the configured allowlist. Current purchase APIs
+`getDiscountedPaymentLinks("SAVE20")` takes only the discount code and uses the
+current session. The HTTP contract remains `POST /app/v2/validateDiscountCode`
+with JSON `{ "code": "SAVE20", "paymentReturnVersion": 1 }` and session Bearer
+authentication. The SDK announces the return capability internally; older requests
+without that field keep their original checkout/return URLs. No Offering
+identifier or request object is needed. SDK success is distinct from `data.isValid`:
+invalid codes remain successful business results; V2 database failures return
+HTTP 500 / `DISCOUNT_LOOKUP_FAILED` and surface as retryable SDK failures through
+the existing retry policy. No raw database details are returned to the app.
+The unchanged result contains `errorCode`, code/discount IDs, percent, message
+and paymentLinks. Its optional `offering` field remains supported but is not sent
+by the current Go endpoint. Each `InappifyPurchaseLink` has an offering identifier
+and URL. Payment URLs must pass the configured allowlist. The method does not
+persist the code, modify cached prices or redeem it; Laravel revalidates the code
+and calculates the price when the returned web link is used. Current purchase APIs
 reject `discountCode` and a nonzero `discount`; do not assume code validation makes
 those purchase-request fields supported.
 
 ## Purchase requests
 
-Both constructors require product/offering identifiers. Prefer the constructor
-with required `productType: InappifyProductType` for a new store integration.
-`CONSUMABLE` uses the grant/acknowledge/consume workflow, `NON_CONSUMABLE` represents
-a durable one-time purchase, and `SUBSCRIPTION` uses store subscription billing.
-Myket rejects SUBSCRIPTION. Omitting productType selects in-app billing without
-inferring whether the item is consumable or non-consumable; the backend determines
-fulfillment.
+`purchase(purchaseParams: InappifyPurchaseParams)` returns the existing
+`InappifyResult<InappifyPurchase>`. Use a package from an Offering:
 
-| Field | Current supported use |
-| --- | --- |
-| `productIdentifier`, `offeringIdentifier` | Required; product must belong to a currently loaded offering for a new attempt |
-| `packageIdentifier` | Select a matching Inappify package; do not pass Android package name |
-| `productType` | Store product classification; required to start subscription billing |
-| `idempotencyKey` | Optional `[A-Za-z0-9_.:-]{1,128}`; unique per logical store attempt; same paid retry resumes its journal |
-| `isCrypto` | Direct only, default false |
-| `paywallId`, `paywallRevision` | Direct attribution via `withPaywallAttribution(id, revision)`; both positive |
-| `market` | Default NONE; stores can accept their matching route; cannot switch server route |
-| `apiKey`, `marketKey`, `dynamicPriceToken` | Unsupported request overrides; omit |
-| `country`, `appVersion`, `discountCode`, `discount` | Unsupported request overrides; omit/default zero |
-| `isLostPurchase`, `lostPurchaseToken`, `lostPurchaseTime` | Not a receipt-import API; leave unused and call recovery instead |
+```kotlin
+client.purchase(InappifyPurchaseParams.Builder(activity, selectedPackage).build())
+```
 
-`purchase(request)` and `purchase(activity, request)` return
-`InappifyResult<InappifyPurchase>`. A new store purchase requires a foreground
-Activity; Direct and resuming an existing paid attempt do not reopen store UI.
-The Activity overload supports the native store UI; both Bazaar and Myket require
-AndroidX ActivityResultRegistryOwner/LifecycleOwner. Public purchase results deliberately
-omit original receipts, signatures and purchase/session tokens.
+`Builder(selectedPackage)` omits the Activity for Direct checkout or an existing
+paid store attempt. A new native purchase still needs a foreground Activity.
+The optional Builder methods are `idempotencyKey(String)`
+and `paywallAttribution(id: Long, revision: Long)`. Paywall attribution
+retains its Direct-only validation. Built parameters are immutable and are not
+stored in the client or persisted; do not retain Activity-backed parameters
+beyond that Activity's lifecycle.
+
+The adapter reads `package.identifier`, `package.product.identifier`,
+`package.offeringIdentifier` and `package.product.productType`. Parent context
+is reconstructed from the containing Offering, including after cache reads, and
+is not written into the package JSON. Go V2's existing `productType` field is
+preserved when present; old catalogs without it keep their existing wire shape.
+The cache version, identity scope and durable purchase journal are unchanged.
+Incomplete or unbound packages fail with `PURCHASE_PACKAGE_CONTEXT_REQUIRED`.
+Native packages without a recognized type fail with `PRODUCT_TYPE_REQUIRED`;
+refresh offerings and ensure the product is classified in the catalog. Direct
+checkout continues to accept catalogs without product type. None of these
+validation failures start billing or issue a purchase request.
+
+`purchase(InappifyPurchaseParams)` returns `InappifyResult<InappifyPurchase>`.
+A new store purchase requires a foreground Activity in its Builder; Direct and
+resuming an existing paid attempt do not reopen store UI. Bazaar and Myket require
+AndroidX ActivityResultRegistryOwner/LifecycleOwner. Public purchase results omit
+original receipts, signatures and purchase/session tokens. Raw purchase commands
+are internal and are not an application API.
+
+Purchase waits for active recovery and uses its matching paid outcome, including
+after a completed checkpoint was removed. Otherwise it resumes a known unfinished
+purchase/delivery for this product and current customer/app/store/endpoint before
+creating fresh work. Original paid Offering/Package bindings and attempt-ID
+conflicts remain authoritative. Unresolved work returns the existing typed
+status/failure; unrelated info/catalog recovery errors do not block an otherwise
+valid purchase. A customer change while waiting returns `PURCHASE_CONTEXT_CHANGED`.
+These checks add no parameters or disk fields and do not start a full recovery
+for each purchase. See [Recovery and cache](RECOVERY_AND_CACHE.md#before-a-new-purchase).
 
 Direct creation is not blindly retried. Its local `idempotencyKey` correlates the
 result but is not sent as a server idempotency header by the current checkout
@@ -267,8 +346,8 @@ not this mapping alone.
 | `setConsumableDeliveryHandler(handler)` | Registration; register before Configure; callback runs off main thread |
 | `syncPendingConsumables()` | `InappifyResult<InappifyConsumableSyncResult>`; discover/resume deliveries and invoke registered handler |
 | `confirmDelivery(deliveryId: Long)` | `InappifyResult<InappifyPurchase>`; acknowledge only a durable host grant; consume store item afterward |
-| `syncPurchases()` | `InappifyResult<List<InappifyPurchase>>`; reconcile owned store work or Direct deliveries |
-| `restorePurchases()` | `InappifyResult<InappifyRestoreResult>`; explicit independent-item restore |
+| `syncStorePurchases()` | `InappifyResult<List<InappifyPurchase>>`; reconcile owned store work or Direct deliveries |
+| `restoreStorePurchases()` | `InappifyResult<InappifyRestoreResult>`; explicit independent-item restore |
 
 `InappifyConsumableDelivery` contains a positive deliveryId, productIdentifier,
 optional transactionIdentifier, and source `DIRECT`, `BAZAAR` or `MYKET`.
@@ -284,9 +363,10 @@ can still contain per-item failures.
 
 `client.snapshot` is an immutable, token-free `InappifySnapshot`: revision,
 isConfigured, isAuthenticated, appUserIdentifier, market, country, appVersion,
-sdkVersion, storeInfo, forceVersion, appId, customerInfo, offerings,
-failedToLoadCustomerInfo, failedToLoadOfferings and storePlatform. The production
-client's `hasForceUpdate` is false and forceVersion is not a rollout-enforcement API.
+sdkVersion, storeInfo, appId, customerInfo, offerings,
+failedToLoadCustomerInfo, failedToLoadOfferings and storePlatform.
+`forceVersion` and `hasForceUpdate` are retired and are not public state. Old
+cache/journal fields remain readable for migration and do not enforce updates.
 
 `addEventListener(InappifyEventListener)` returns an
 `InappifyListenerRegistration`. Close it when observation ends; close is
@@ -376,3 +456,15 @@ permission to retry a payment. A payloadless subscription's definitive ownership
 evidence rejection quarantines its checkpoint; transient failures preserve it.
 Coroutine cancellation can throw CancellationException, and calls after close
 are invalid lifecycle use. Do not convert either into payment success.
+
+## Logging
+
+| Global setting | Purpose |
+| --- | --- |
+| `InappifyClient.logLevel = InappifyLogLevel.DEBUG` | Minimum severity; set before Configure |
+| `InappifyClient.logHandler = handler` | Replace the default Logcat output |
+| `InappifyClient.logHandler = DefaultInappifyLogHandler()` | Restore Logcat output |
+
+Levels: VERBOSE, DEBUG, INFO, WARN, ERROR. Defaults: DEBUG in development,
+INFO in release. Configuration is process-wide and does not require a session.
+See [safe logging and handler examples](SECURITY_AND_DIAGNOSTICS.md#sdk-log-levels-and-custom-handling).
