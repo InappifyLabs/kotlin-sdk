@@ -54,7 +54,7 @@ internal class EncryptedSessionStateStore private constructor(
     private val applicationContext: Context,
     private val ioDispatcher: CoroutineDispatcher,
     private val goV2: Boolean = false,
-) : SessionStateStore {
+) : SessionStateStore, PurchaseAttemptStorage {
 
     private val sessionFile = AtomicFile(
         File(applicationContext.noBackupFilesDir, if (goV2) "inappify_go_session_v2.bin" else SESSION_FILE_NAME),
@@ -62,6 +62,8 @@ internal class EncryptedSessionStateStore private constructor(
     private val pendingStoreOperationsFile = AtomicFile(
         File(applicationContext.noBackupFilesDir, PENDING_OPERATIONS_FILE_NAME),
     )
+    private val purchaseAttemptsFile = AtomicFile(File(applicationContext.noBackupFilesDir, "inappify_purchase_attempts_v1.bin"))
+    private val purchaseAttemptsCipher = SessionCipher(applicationContext, CipherKeyScope.PURCHASE_ATTEMPTS)
     private val migrationMarker = File(
         applicationContext.noBackupFilesDir,
         MIGRATION_MARKER_FILE_NAME,
@@ -150,6 +152,28 @@ internal class EncryptedSessionStateStore private constructor(
         withStorageLockOrFallback(emptyList()) {
             readPendingStoreRecoveryState()?.operations.orEmpty()
         }
+
+    override suspend fun readPurchaseAttemptHistory(): String? = withStorageLockOrFallback(null) {
+        readPurchaseAttempts()
+    }
+
+    override suspend fun mutatePurchaseAttemptHistory(mutation: (String) -> String): Boolean = withStorageLockOrFallback(false) {
+        val next = mutation(readPurchaseAttempts() ?: return@withStorageLockOrFallback false).encodeToByteArray()
+        require(next.size <= 2 * 1024 * 1024)
+        val encrypted = purchaseAttemptsCipher.encrypt(next, allowKeyReset = !purchaseAttemptsFile.hasRecoverableData())
+        val output = purchaseAttemptsFile.startWrite()
+        try {
+            output.write(encrypted); output.fd.sync(); purchaseAttemptsFile.finishWrite(output); true
+        } catch (exception: Exception) { purchaseAttemptsFile.failWrite(output); throw exception }
+    }
+
+    private fun readPurchaseAttempts(): String? {
+        if (!purchaseAttemptsFile.promoteInterruptedFirstWrite()) return null
+        if (!purchaseAttemptsFile.hasRecoverableData()) return "{\"version\":1,\"attempts\":[]}"
+        return purchaseAttemptsFile.openRead().use { input ->
+            purchaseAttemptsCipher.decrypt(input.readBytesWithLimit(2 * 1024 * 1024 + 1024)).decodeToString()
+        }
+    }
 
     override suspend fun loadPendingStoreRecoveryState(): PendingStoreRecoveryState? =
         withStorageLockOrFallback(null) {
@@ -799,6 +823,12 @@ private enum class CipherKeyScope(
     val wrappedAesKeyFileName: String,
     val certificateCommonName: String,
 ) {
+    PURCHASE_ATTEMPTS(
+        aesKeyAlias = "com.inappify.sdk.purchase_attempts.aes.v1",
+        rsaKeyAlias = "com.inappify.sdk.purchase_attempts.rsa.v1",
+        wrappedAesKeyFileName = "inappify_wrapped_purchase_attempts_key_v1.bin",
+        certificateCommonName = "Inappify Purchase Attempts Key",
+    ),
     GO_V2(
         aesKeyAlias = "com.inappify.sdk.go_session.aes.v2",
         rsaKeyAlias = "com.inappify.sdk.go_session.rsa.v2",

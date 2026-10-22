@@ -1,7 +1,7 @@
 # Kotlin API reference
 
-Artifact: `com.github.InappifyLabs:kotlin-sdk:v0.2.0`.
-SDK-reported version: `0.2.0`, without the
+Artifact: `com.github.InappifyLabs:kotlin-sdk:v0.2.1`.
+SDK-reported version: `0.2.1`, without the
 Git tag prefix. Configure, snapshots and targeting use that exact value; local
 version normalization does not alter production server offering selection. Public types and extension functions live in
 `com.inappify.sdk`; import individual symbols or `com.inappify.sdk.*`.
@@ -360,6 +360,51 @@ alreadyProcessedCount, failedCount and totalCount; successful aggregate results
 can still contain per-item failures.
 
 ## Events, state and diagnostics
+
+### Purchase outcomes and restart-safe lookup
+
+```kotlin
+val listener = client.addEventListener { event ->
+    event.purchaseAttempt?.let { attempt ->
+        // attemptId is the original logical-attempt/idempotency key.
+        // Inspect status, purchase and error; repeated events are idempotent by attemptId.
+    }
+}
+// After Configure, including after process death:
+val previous = client.getPurchaseAttempt("saved-attempt-id")
+val knownAttempts = client.getPurchaseAttempts()
+```
+
+`PURCHASE_UPDATED` carries `purchaseAttempt` and uses its `attemptId` as
+`requestId`. Purchase and store recovery use the same outcome shape. `PENDING`
+includes uncertain errors and deliveries awaiting fulfillment; `SUCCEEDED` is a
+server-confirmed completed result; `FAILED` is a definitive rejection/cancellation.
+A successful lookup may contain null: unknown is never proof of failure or
+permission to pay again. Storage failures are failures, not empty history.
+Existing purchase/sync return values remain unchanged; `syncStorePurchases()`
+is not a terminal-history query. A result is not live entitlement authorization.
+
+History uses a separate AES-GCM/Android-Keystore file under no-backup storage,
+bound to endpoint/API key, app, customer and market. It survives process/client
+recreation and session changes but is visible only to the matching configured
+identity. Reads perform no network/store requests or cache updates. Retention is
+256 latest terminal outcomes without time-based expiry, plus up to 256 pending
+attempts. Pending records are never evicted to admit a terminal record. Completed
+store outcomes are saved before their recovery checkpoint is removed; failed
+saves retain the paid checkpoint for retry. Session/cache/journal schemas are
+unchanged, and old SDKs ignore the new file. Events are at-least-once; read history
+after configure for missed events and keep host inventory grants idempotent.
+
+Direct checkout sends its durable `attemptId` to Laravel. Replaying that ID cannot
+create another payment. Existing recovery reads `purchase-attempts/status` in
+batches of at most 100 IDs and records only matching app/customer/product/offering
+results. Subscriptions and lifetime products complete after server-confirmed
+payment; consumables complete after the existing delivery acknowledgement.
+Live events and history use the original ID. Existing consumable sync/confirm
+return values retain their `direct-delivery-<id>` identity for compatibility.
+Unknown, unavailable and unrelated results remain pending. A payment return link
+only wakes recovery. Older payments without a server attempt binding retain their
+existing behavior; no product-based association is inferred.
 
 `client.snapshot` is an immutable, token-free `InappifySnapshot`: revision,
 isConfigured, isAuthenticated, appUserIdentifier, market, country, appVersion,

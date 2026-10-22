@@ -44,6 +44,7 @@ class GoCommerceSessionTest {
         } }
         commerce.handler = { request -> when (request.path) {
             "purchase" -> commerce.response(jsonObject("""{"status":true,"data":{"purchaseStatus":"DONE"}}"""))
+            "purchase-attempts/status" -> commerce.response(jsonObject("""{"status":true,"data":{"attempts":[]}}"""))
             "consumable-deliveries/pending" -> commerce.response(JsonObject().apply {
                 addProperty("status", true); add("data", JsonObject().apply {
                     add("deliveries", com.google.gson.JsonArray().apply { if (pending) add(delivery()) })
@@ -74,7 +75,7 @@ class GoCommerceSessionTest {
             commerce.requests.forEach {
                 assertEquals("Bearer session-initial", it.headers["Authorization"])
                 assertEquals("application/json", it.headers["Accept"])
-                assertTrue(jsonObject(it.jsonBody).keySet().all { field -> field in setOf("productIdentifier", "offeringIdentifier", "paymentReturnVersion", "paywallId", "paywallRevision") })
+                assertTrue(jsonObject(it.jsonBody).keySet().all { field -> field in setOf("productIdentifier", "offeringIdentifier", "attemptId", "paymentReturnVersion", "paywallId", "paywallRevision") })
             }
         }
     }
@@ -135,7 +136,10 @@ class GoCommerceSessionTest {
             assertTrue(sdk.confirmDelivery(7) is InappifyResult.Success)
             assertTrue(sdk.confirmDelivery(7) is InappifyResult.Success)
             assertEquals(listOf("consumable-deliveries/pending", "consumable-deliveries/7/delivered"), commerce.requests.map { it.path })
-            assertTrue(commerce.requests.all { it.jsonBody == "{}" && it.headers["Authorization"] == "Bearer session-initial" })
+            assertTrue(commerce.requests.all {
+                jsonObject(it.jsonBody).number("purchaseAttemptTrackingVersion") == 1L &&
+                    it.headers["Authorization"] == "Bearer session-initial"
+            })
         }
     }
     @Test fun persistedHostGrantRetriesAckAfterRestartEvenWhenPendingIsEmpty() = runBlocking {
@@ -289,7 +293,8 @@ class GoCommerceSessionTest {
                 assertTrue(request.getHeader("Content-Type")!!.startsWith("application/json"))
                 val body = jsonObject(request.body.readUtf8())
                 assertTrue(body.keySet().intersect(setOf("apikey", "apiKey", "token", "appIdentifier", "country", "appVersion", "forceVersion")).isEmpty())
-                if (index in listOf(1, 2, 4, 5)) assertEquals(0, body.size())
+                if (index in listOf(1, 2)) assertEquals(1L, body.number("purchaseAttemptTrackingVersion"))
+                if (index in listOf(4, 5)) assertEquals(0, body.size())
                 if (index == 3) assertEquals("receipt-secret", body.getAsJsonObject("purchase").string("token"))
             }
             assertEquals(7, traces.size)

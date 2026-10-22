@@ -8,10 +8,14 @@ internal class GoV2DirectDelivery(val json: JsonObject) {
     val id: Long = json.deliveryNumber("deliveryId", positive = true) ?: invalid()
     val product: String = json.deliveryText("productIdentifier")?.takeIf { it.isNotBlank() } ?: invalid()
     val transaction: String? = json.deliveryText("transactionId")
+    val attemptId: String? = json.deliveryText("attemptId")
+    val offering: String? = json.deliveryText("offeringIdentifier")
     val status: String = json.deliveryText("status") ?: invalid()
     val completed: Boolean get() = status == "COMPLETED"
     init {
         if (json.deliveryText("source") != "direct" || status !in setOf("DELIVERY_REQUIRED", "COMPLETED")) invalid()
+        if ((attemptId == null) != (offering == null) || attemptId != null &&
+            (!attemptId.matches(Regex("[A-Za-z0-9_.:-]{1,128}")) || offering.isNullOrBlank())) invalid()
         json.deliveryNumber("paymentId", positive = true)
         json.deliveryNumber("consumeAttempts", positive = false)
         val delivered = json.get("alreadyDelivered")?.takeUnless { it.isJsonNull }?.let {

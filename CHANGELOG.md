@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.1
+
+- Correlate new Direct checkout/recovery with the original attempt ID, including
+  payment-status lookup after restart. Keep legacy consumable sync/confirm results.
+- Add encrypted app/customer/market-bound purchase outcome history with
+  `getPurchaseAttempt` / `getPurchaseAttempts` and correlated `PURCHASE_UPDATED`
+  events. Save completed store outcomes before checkpoint cleanup for restart-safe
+  lookup. Preserve purchase/sync results, cache/journal schemas and scheduling.
+
 ## 0.2.0
 
 - Add global RevenueCat-style log levels and custom log handlers, available before

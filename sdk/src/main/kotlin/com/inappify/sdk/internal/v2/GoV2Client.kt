@@ -52,7 +52,7 @@ internal class GoV2Client(
     private val recoveryRefreshPolicy: RecoveryRefreshPolicy = RecoveryRefreshPolicy(),
     private val paymentLinkMonitor: PaymentLinkMonitor = NoPaymentLinkMonitor(),
 ) : InappifyV2Client, StoreV2CapableClient, ConsumableFulfillmentCapableClient, HttpDiagnosticsCapableClient,
-    InappifyV2RuntimeCapabilities, TargetingSyncCapableClient {
+    InappifyV2RuntimeCapabilities, TargetingSyncCapableClient, PurchaseAttemptCapableClient {
     constructor(config: InappifyV2Configuration, sdkApi: GoApi, storage: SessionStateStore,
         metadata: AppMetadataProvider, now: () -> Long = System::currentTimeMillis,
         eventDispatcher: CoroutineDispatcher = Dispatchers.Main.immediate, backgroundRecovery: Boolean = true,
@@ -92,6 +92,7 @@ internal class GoV2Client(
     private var options: InappifyOptions? = null
     private var document = JsonObject()
     private var deliveryHandler: InappifyConsumableDeliveryHandler? = null
+    private val attemptHistory = PurchaseAttemptHistory(storage as? PurchaseAttemptStorage)
     private var renewalFailure: V2Failure? = null
     private var nextRenewalAt = 0L
     private var detectedCountry: String? = null
@@ -101,7 +102,12 @@ internal class GoV2Client(
     private val storeCoordinator = commerceApi?.let {
         StoreV2Coordinator(GoV2StoreService(::commerceRequest), storage, billingFactory, now,
             registerActiveAdapter = ::registerBillingAdapter,
-            unregisterActiveAdapter = { adapter -> synchronized(lifecycleLock) { activeBillingAdapters.remove(adapter) }; Unit })
+            unregisterActiveAdapter = { adapter -> synchronized(lifecycleLock) { activeBillingAdapters.remove(adapter) }; Unit },
+            beforeTerminal = { operation, state ->
+                try { recordStoreAttempt(StoreV2Outcome.Terminal(operation, state), emit = false); true }
+                catch (cancelled: CancellationException) { throw cancelled }
+                catch (_: Exception) { false }
+            })
     }
     @Volatile private var closed = false
     @Volatile private var currentSnapshot = InappifySnapshot.initial(BuildConfig.SDK_VERSION)
@@ -776,6 +782,74 @@ internal class GoV2Client(
     }
     override fun isActiveEntitlement(identifier: String): Boolean = getEntitlement(identifier) != null
     override fun hasEntitlement(identifier: String): Boolean = isActiveEntitlement(identifier)
+    override suspend fun purchaseAttempt(attemptId: String): InappifyResult<InappifyPurchaseAttempt?> = run {
+        requireSession()
+        if (!attemptId.matches(Regex("[A-Za-z0-9_.:-]{1,128}"))) fail("VALIDATION", "PURCHASE_ATTEMPT_INVALID")
+        readPurchaseAttempts().firstOrNull { it.attemptId == attemptId }
+    }
+    override suspend fun purchaseAttempts(): InappifyResult<List<InappifyPurchaseAttempt>> = run {
+        requireSession(); readPurchaseAttempts()
+    }
+    private suspend fun readPurchaseAttempts(): List<InappifyPurchaseAttempt> = try {
+        java.util.Collections.unmodifiableList(attemptHistory.list(currentAttemptBinding()))
+    } catch (cancelled: CancellationException) { throw cancelled }
+      catch (_: Exception) { fail("STORAGE", "PURCHASE_ATTEMPT_HISTORY_UNAVAILABLE") }
+
+    private fun attemptBinding(api: String, customer: String, app: String, appId: Long?, store: String): String =
+        digest(listOf(api, customer, app, appId.toString(), store).joinToString("") { "${it.length}:$it" })
+    private fun currentAttemptBinding(): String {
+        requireSession()
+        val session = document.getAsJsonObject("session") ?: fail("CONFIGURATION", "NOT_CONFIGURED")
+        return attemptBinding(storeFingerprint(options!!), digest(session.string("appUserId")),
+            metadata.get().packageIdentifier, session.number("appId"), nativeStoreMarket(snapshot.storePlatform)?.storeId ?: "direct")
+    }
+    private suspend fun recordAttempt(binding: String, value: InappifyPurchaseAttempt, emit: Boolean = true,
+        outcomeMayHaveCommitted: Boolean = true, directTracking: Boolean = false): InappifyPurchaseAttempt {
+        val recorded = try {
+            check(attemptHistory.put(binding, value, directTracking))
+            attemptHistory.list(binding).first { it.attemptId == value.attemptId }
+        } catch (cancelled: CancellationException) { throw cancelled }
+          catch (_: Exception) { fail("STORAGE", "PURCHASE_ATTEMPT_RESULT_NOT_PERSISTED",
+            diagnostics = mapOf("outcomeMayHaveCommitted" to outcomeMayHaveCommitted, "attemptId" to value.attemptId)) }
+        if (emit) emitPurchaseAttempt(binding, recorded)
+        return recorded
+    }
+    private fun emitPurchaseAttempt(binding: String, value: InappifyPurchaseAttempt) {
+        val published = snapshot
+        val generation = recoveryGeneration
+        scope.launch(eventDispatcher) {
+            if (!closed && recoveryGeneration == generation && runCatching { currentAttemptBinding() }.getOrNull() == binding) {
+                val event = InappifyEvent.create(InappifyEventType.PURCHASE_UPDATED, published, value.attemptId, value)
+                listeners.forEach { listener -> runCatching { listener.onEvent(event) } }
+            }
+        }
+    }
+    private fun safeAttemptError(error: InappifyError): InappifyError = InappifyError(error.code,
+        "Purchase attempt ${error.code.name}.", error.isRetryable, error.details.filter { (key, value) ->
+            key in setOf("category", "serverCode", "httpStatus", "outcomeMayHaveCommitted", "phase", "attemptId", "store", "storeCode") &&
+                (value == null || value is String || value is Boolean || value is Number)
+        })
+    private suspend fun recordStoreAttempt(outcome: StoreV2Outcome, emit: Boolean = true): InappifyPurchaseAttempt {
+        val operation = outcome.operation
+        val error = when (outcome) {
+            is StoreV2Outcome.Failure -> outcome.error
+            is StoreV2Outcome.Rejected -> outcome.error
+            is StoreV2Outcome.Deferred -> deferredStoreError(outcome)
+            else -> null
+        }
+        val status = when {
+            outcome is StoreV2Outcome.Terminal -> InappifyPurchaseAttemptStatus.SUCCEEDED
+            outcome is StoreV2Outcome.Rejected && (outcome.state?.status == StorePurchaseStatus.REJECTED ||
+                outcome.requiresRejectionTombstone) || outcome is StoreV2Outcome.Failure &&
+                outcome.requiresRejectionTombstone -> InappifyPurchaseAttemptStatus.FAILED
+            else -> InappifyPurchaseAttemptStatus.PENDING
+        }
+        val purchase = if (error == null) storePurchaseResult(outcome, originalPackage(operation)) else null
+        return recordAttempt(attemptBinding(operation.apiKeyFingerprint, operation.customerIdentifierFingerprint,
+            operation.appIdentifier, operation.appId, operation.store), InappifyPurchaseAttempt(operation.id,
+            operation.productIdentifier, operation.offeringIdentifier.orEmpty(), requireNotNull(nativeStoreMarket(operation.store)),
+            status, purchase, error?.let(::safeAttemptError), now()), emit)
+    }
     override fun isCustomerAnonymous(appUserIdentifier: String?): Boolean = appUserIdentifier?.let(::isAnonymous) == true
     override suspend fun purchase(purchaseParams: InappifyPurchaseParams): InappifyResult<InappifyPurchase> {
         InappifyLogger.log(InappifyLogLevel.DEBUG) { "Starting package purchase." }
@@ -940,11 +1014,19 @@ internal class GoV2Client(
             fail("VALIDATION", "PURCHASE_OVERRIDE_NOT_ALLOWED")
         if (request.idempotencyKey != null && !request.idempotencyKey.matches(Regex("[A-Za-z0-9_.:-]{1,128}")))
             fail("VALIDATION", "PURCHASE_ATTEMPT_INVALID")
+        val attemptId = request.idempotencyKey ?: UUID.randomUUID().toString()
+        val binding = currentAttemptBinding()
+        val intent = InappifyPurchase(attemptId, request.productIdentifier, request.offeringIdentifier,
+            InappifyMarket.NONE, packageIdentifier = packageIdentifier)
+        recordAttempt(binding, InappifyPurchaseAttempt(attemptId, request.productIdentifier, request.offeringIdentifier,
+            InappifyMarket.NONE, InappifyPurchaseAttemptStatus.PENDING, intent, null, now()), outcomeMayHaveCommitted = false,
+            directTracking = true)
         val response = try {
             // Only an explicit SESSION_EXPIRED rejection permits one authenticated replay.
             commerceRequest("purchase", JsonObject().apply {
                 addProperty("productIdentifier", request.productIdentifier)
                 addProperty("offeringIdentifier", request.offeringIdentifier)
+                addProperty("attemptId", attemptId)
                 addProperty("paymentReturnVersion", 1)
                 request.paywallId?.let { addProperty("paywallId", it) }
                 request.paywallRevision?.let { addProperty("paywallRevision", it) }
@@ -953,7 +1035,7 @@ internal class GoV2Client(
             val category = e.sdkError.details["category"]
             val status = e.sdkError.details["httpStatus"] as? Int
             val uncertain = category in setOf("NETWORK", "TIMEOUT", "DECODING") ||
-                (status != null && status >= 500)
+                status != null // A rejection can follow durable payment creation; only status lookup proves otherwise.
             if (!uncertain) throw e
             throw V2Failure(InappifyError(e.sdkError.code, e.sdkError.message, e.sdkError.isRetryable,
                 e.sdkError.details + mapOf("outcomeMayHaveCommitted" to true)))
@@ -970,9 +1052,21 @@ internal class GoV2Client(
         }
         if (status == InappifyPurchaseStatus.NEEDTOPAY && url.isNullOrBlank())
             fail("DECODING", "MISSING_PAYMENT_URL", diagnostics = mapOf("outcomeMayHaveCommitted" to true))
-        return InappifyPurchase(request.idempotencyKey ?: UUID.randomUUID().toString(),
+        val purchase = InappifyPurchase(attemptId,
             request.productIdentifier, request.offeringIdentifier, InappifyMarket.NONE, status,
             packageIdentifier, url)
+        val authoritative = data.get("attempt")?.takeUnless { it.isJsonNull }?.let { raw ->
+            if (!raw.isJsonObject) fail("DECODING", "INVALID_DIRECT_PURCHASE_ATTEMPT")
+            val tracked = GoV2DirectAttempt(raw.asJsonObject)
+            validateDirectAttempt(tracked, attemptId, request.productIdentifier, request.offeringIdentifier)
+            // A callback may complete between checkout creation and this response.
+            if (tracked.status == InappifyPurchaseAttemptStatus.FAILED) fail("DECODING", "DIRECT_PURCHASE_ATTEMPT_SCOPE_MISMATCH")
+            tracked.result(packageIdentifier, now())
+        }
+        recordAttempt(binding, authoritative ?: InappifyPurchaseAttempt(attemptId, request.productIdentifier, request.offeringIdentifier,
+            InappifyMarket.NONE, if (status == InappifyPurchaseStatus.DONE) InappifyPurchaseAttemptStatus.SUCCEEDED
+            else InappifyPurchaseAttemptStatus.PENDING, purchase, null, now()), directTracking = true)
+        return purchase
     }
     /** Called only under the state mutex: renewal, verification, persistence and replay are single-flight. */
     private suspend fun commerceRequest(endpoint: String, body: JsonObject): GoApiResponse {
@@ -1049,6 +1143,9 @@ internal class GoV2Client(
         val appId = context.appId?.takeIf { it > 0 } ?: fail("CONFIGURATION", "STORE_APP_ID_REQUIRED")
         val nativePackageIdentifier = packageIdentifier?.takeIf(String::isNotBlank)
             ?: fail("VALIDATION", "PACKAGE_IDENTIFIER_REQUIRED")
+        val binding = currentAttemptBinding()
+        recordAttempt(binding, InappifyPurchaseAttempt(attemptId, request.productIdentifier, request.offeringIdentifier,
+            context.market, InappifyPurchaseAttemptStatus.PENDING, null, null, now()), outcomeMayHaveCommitted = false)
         val adapter = createBillingAdapter(context.marketKey, context.market)
         val developerPayload = JsonObject().apply {
             addProperty("offeringIdentifier", request.offeringIdentifier)
@@ -1071,6 +1168,13 @@ internal class GoV2Client(
                     "The marketplace purchase was cancelled."))
                 is StoreBillingResult.Failure -> throw V2Failure(billed.error.toGoPurchaseError(attemptId, context.store))
             }
+        } catch (failure: V2Failure) {
+            val definitive = failure.sdkError.code == InappifyErrorCode.PURCHASE_CANCELLED &&
+                failure.sdkError.details["outcomeMayHaveCommitted"] != true
+            recordAttempt(binding, InappifyPurchaseAttempt(attemptId, request.productIdentifier, request.offeringIdentifier,
+                context.market, if (definitive) InappifyPurchaseAttemptStatus.FAILED else InappifyPurchaseAttemptStatus.PENDING,
+                null, safeAttemptError(failure.sdkError), now()))
+            throw failure
         } finally { releaseBillingAdapter(adapter) }
         if (receipt.productIdentifier != request.productIdentifier || receipt.packageName != context.appIdentifier ||
             runCatching { JsonParser.parseString(receipt.developerPayload) == JsonParser.parseString(developerPayload) }
@@ -1126,6 +1230,7 @@ internal class GoV2Client(
         )
     }
     private suspend fun finalizeRejectedStoreOutcome(outcome: StoreV2Outcome, context: StoreV2Context) {
+        val tracked = recordStoreAttempt(outcome, emit = false)
         val permanent = when (outcome) {
             is StoreV2Outcome.Rejected -> outcome.state?.status == StorePurchaseStatus.REJECTED ||
                 outcome.requiresRejectionTombstone
@@ -1134,7 +1239,9 @@ internal class GoV2Client(
         }
         if (permanent && !storage.finalizePendingStoreOperationWithTombstone(outcome.operation.id,
                 storeTombstone(outcome.operation, context))) fail("STORAGE", "STORE_REJECTION_NOT_PERSISTED")
-        // Only waiting callers retain these outcomes; no terminal-purchase cache is created.
+        emitPurchaseAttempt(attemptBinding(outcome.operation.apiKeyFingerprint, outcome.operation.customerIdentifierFingerprint,
+            outcome.operation.appIdentifier, outcome.operation.appId, outcome.operation.store), tracked)
+        // Waiting callers retain the original outcome independently of the read-only history.
         val pass = currentCoroutineContext()[RecoveryPass] ?: return
         val observed = try {
             InappifyResult.Success(storePurchaseResult(outcome, originalPackage(outcome.operation)), snapshot)
@@ -1509,7 +1616,7 @@ internal class GoV2Client(
             }
         }
         for (batch in 0 until 100) {
-            val response = commerceRequest("consumable-deliveries/pending", JsonObject()).body
+            val response = commerceRequest("consumable-deliveries/pending", directTrackingRequest()).body
             val elements = response.getAsJsonObject("data")?.get("deliveries")
                 ?.takeIf { it.isJsonArray }?.asJsonArray ?: fail("DECODING", "INVALID_DIRECT_DELIVERIES")
             val deliveries = elements.map { element ->
@@ -1523,7 +1630,9 @@ internal class GoV2Client(
                 val previous = records.getAsJsonObject(delivery.id.toString())
                 previous?.getAsJsonObject("delivery")?.let { saved ->
                     if (GoV2DirectDelivery(saved).product != delivery.product ||
-                        GoV2DirectDelivery(saved).transaction != delivery.transaction)
+                        GoV2DirectDelivery(saved).transaction != delivery.transaction ||
+                        GoV2DirectDelivery(saved).attemptId?.let { it != delivery.attemptId } == true ||
+                        GoV2DirectDelivery(saved).offering?.let { it != delivery.offering } == true)
                         fail("DECODING", "DELIVERY_SCOPE_MISMATCH")
                     if (GoV2DirectDelivery(saved).completed && !delivery.completed)
                         fail("DECODING", "DELIVERY_STATE_REGRESSION")
@@ -1560,17 +1669,21 @@ internal class GoV2Client(
             }
             if (firstError != null || deliveries.size < 100 || !progress || fresh == 0) break
         }
+        val attemptFailure = syncDirectPurchaseAttempts()
+        if (firstError == null) firstError = attemptFailure
         firstError?.let { throw it }
         return DirectReconciliation(InappifyConsumableSyncResult(discovered.size, completed.size, pending.values.toList()),
             purchases.values.toList())
     }
     private suspend fun observeDirectRecovery(purchase: InappifyPurchase): InappifyPurchase {
+        recordDirectAttempt(purchase)
         currentCoroutineContext()[RecoveryPass]?.record(RecoveredPurchase(purchase.attemptId,
             purchase.productIdentifier, InappifyResult.Success(purchase, snapshot)))
         return purchase
     }
     private suspend fun observeDirectFailure(delivery: GoV2DirectDelivery, failure: V2Failure) {
         val purchase = delivery.purchase()
+        recordDirectAttempt(purchase, failure.sdkError)
         currentCoroutineContext()[RecoveryPass]?.record(RecoveredPurchase(purchase.attemptId,
             purchase.productIdentifier, InappifyResult.Failure(failure.sdkError, snapshot)))
     }
@@ -1580,18 +1693,20 @@ internal class GoV2Client(
         val records = directRecords()
         val record = records.getAsJsonObject(deliveryId.toString()) ?: fail("VALIDATION", "DELIVERY_NOT_FOUND")
         val expected = GoV2DirectDelivery(record.getAsJsonObject("delivery"))
-        if (expected.completed) return expected.purchase()
+        if (expected.completed) return expected.purchase().also { recordDirectAttempt(it) }
         // The public confirm API is the host's durable-grant assertion. Persist before HTTP
         // so a timeout/process restart retries acknowledgement without calling the handler again.
         record.addProperty("hostDelivered", true)
         saveDirectRecords(records)
         val delivered = try {
-            val response = commerceRequest("consumable-deliveries/$deliveryId/delivered", JsonObject()).body
+            val response = commerceRequest("consumable-deliveries/$deliveryId/delivered", directTrackingRequest()).body
             val data = response.get("data")?.takeIf { it.isJsonObject }?.asJsonObject
                 ?: fail("DECODING", "INVALID_DIRECT_DELIVERY")
             GoV2DirectDelivery(data).also {
                 if (it.id != deliveryId || it.product != expected.product ||
-                    it.transaction != expected.transaction || !it.completed)
+                    it.transaction != expected.transaction || !it.completed ||
+                    expected.attemptId?.let { original -> original != it.attemptId } == true ||
+                    expected.offering?.let { original -> original != it.offering } == true)
                     fail("DECODING", "DELIVERY_SCOPE_MISMATCH")
             }
         } catch (failure: V2Failure) {
@@ -1603,8 +1718,78 @@ internal class GoV2Client(
                 error.details + mapOf("outcomeMayHaveCommitted" to true)))
         }
         record.add("delivery", delivered.json.deepCopy())
+        recordDirectAttempt(delivered.purchase(), delivery = delivered)
         saveDirectRecords(records)
         return delivered.purchase()
+    }
+    private fun directTrackingRequest(): JsonObject = JsonObject().apply { addProperty("purchaseAttemptTrackingVersion", 1) }
+    private suspend fun recordDirectAttempt(purchase: InappifyPurchase, error: InappifyError? = null, delivery: GoV2DirectDelivery? = null) {
+        val binding = currentAttemptBinding()
+        val context = delivery ?: purchase.deliveryId?.let { directRecords().getAsJsonObject(it.toString()) }
+            ?.getAsJsonObject("delivery")?.let(::GoV2DirectDelivery)
+        val original = context?.attemptId?.let { id -> attemptHistory.list(binding).firstOrNull { it.attemptId == id } }
+        if (original != null && (original.productIdentifier != context?.product || original.offeringIdentifier != context?.offering))
+            fail("DECODING", "DIRECT_PURCHASE_ATTEMPT_SCOPE_MISMATCH")
+        val tracked = if (context?.attemptId != null) InappifyPurchase.storeResult(context.attemptId, context.product,
+            requireNotNull(context.offering), original?.purchase?.packageIdentifier,
+            if (purchase.purchaseStatus == InappifyPurchaseStatus.DONE) InappifyStorePurchaseStatus.COMPLETED else InappifyStorePurchaseStatus.DELIVERY_REQUIRED,
+            context.id, null, false, InappifyMarket.NONE) else purchase
+        if (tracked.attemptId != purchase.attemptId && attemptHistory.list(binding).any { it.attemptId == purchase.attemptId }) {
+            recordAttempt(binding, InappifyPurchaseAttempt(purchase.attemptId, purchase.productIdentifier,
+                purchase.offeringIdentifier, purchase.market, if (purchase.purchaseStatus == InappifyPurchaseStatus.DONE)
+                    InappifyPurchaseAttemptStatus.SUCCEEDED else InappifyPurchaseAttemptStatus.PENDING,
+                purchase, error?.let(::safeAttemptError), now()), emit = false)
+        }
+        recordAttempt(binding, InappifyPurchaseAttempt(tracked.attemptId, tracked.productIdentifier,
+            tracked.offeringIdentifier, tracked.market, if (tracked.purchaseStatus == InappifyPurchaseStatus.DONE)
+                InappifyPurchaseAttemptStatus.SUCCEEDED else InappifyPurchaseAttemptStatus.PENDING,
+            tracked, error?.let(::safeAttemptError), now()), directTracking = context?.attemptId != null)
+    }
+    private fun validateDirectAttempt(value: GoV2DirectAttempt, id: String, product: String, offering: String,
+        deliveryId: Long? = null) {
+        if (value.id != id || value.product != product || value.offering != offering ||
+            deliveryId?.let { it != value.deliveryId } == true ||
+            value.url?.let { !allowedUrl(it, config.paymentHosts) } == true)
+            fail("DECODING", "DIRECT_PURCHASE_ATTEMPT_SCOPE_MISMATCH")
+    }
+    private suspend fun syncDirectPurchaseAttempts(): V2Failure? {
+        val binding = currentAttemptBinding()
+        var firstError: V2Failure? = null
+        for (batch in attemptHistory.pendingDirect(binding).chunked(100)) {
+            val known = batch.associateBy { it.attemptId }
+            try {
+                val response = commerceRequest("purchase-attempts/status", JsonObject().apply {
+                    add("attemptIds", JsonArray().apply { batch.forEach { add(it.attemptId) } })
+                }).body
+                val rows = response.getAsJsonObject("data")?.get("attempts")?.takeIf { it.isJsonArray }?.asJsonArray
+                    ?: fail("DECODING", "INVALID_DIRECT_PURCHASE_ATTEMPTS")
+                if (rows.size() > batch.size) fail("DECODING", "INVALID_DIRECT_PURCHASE_ATTEMPTS")
+                val parsed = rows.map { GoV2DirectAttempt(it.asJsonObject) }
+                if (parsed.map { it.id }.toSet().size != parsed.size) fail("DECODING", "INVALID_DIRECT_PURCHASE_ATTEMPTS")
+                parsed.forEach { value ->
+                    val saved = known[value.id] ?: fail("DECODING", "DIRECT_PURCHASE_ATTEMPT_SCOPE_MISMATCH")
+                    validateDirectAttempt(value, saved.attemptId, saved.productIdentifier, saved.offeringIdentifier,
+                        saved.purchase?.deliveryId)
+                }
+                parsed.forEach { value ->
+                    recordAttempt(binding, value.result(known.getValue(value.id).purchase?.packageIdentifier, now()), directTracking = true)
+                }
+            } catch (cancelled: CancellationException) { throw cancelled }
+              catch (failure: V2Failure) {
+                // Missing (including an older server), unrelated and unavailable results never clear an attempt.
+                if (firstError == null) firstError = failure
+                batch.forEach { saved -> recordAttempt(binding, InappifyPurchaseAttempt(saved.attemptId,
+                    saved.productIdentifier, saved.offeringIdentifier, saved.market, saved.status, saved.purchase,
+                    safeAttemptError(failure.sdkError), now()), directTracking = true) }
+            } catch (_: Exception) {
+                if (firstError == null) firstError = V2Failure(InappifyError(InappifyErrorCode.MALFORMED_RESPONSE,
+                    "Invalid direct purchase status response."))
+                batch.forEach { saved -> recordAttempt(binding, InappifyPurchaseAttempt(saved.attemptId,
+                    saved.productIdentifier, saved.offeringIdentifier, saved.market, saved.status, saved.purchase,
+                    InappifyError(InappifyErrorCode.MALFORMED_RESPONSE, "Invalid direct purchase status response."), now()), directTracking = true) }
+            }
+        }
+        return firstError
     }
     override suspend fun syncStorePurchases(): InappifyResult<List<InappifyPurchase>> {
         val result = run {
@@ -1766,7 +1951,7 @@ internal class GoV2Client(
         if (snapshot.storePlatform == "DirectAndroid")
             return directRecords().entrySet().any { (_, record) ->
                 record.asJsonObject.getAsJsonObject("delivery").string("status") != "COMPLETED"
-            }
+            } || attemptHistory.pendingDirect(currentAttemptBinding()).isNotEmpty()
         val market = nativeStoreMarket(snapshot.storePlatform) ?: return false
         val opt = options ?: return false
         val session = document.getAsJsonObject("session") ?: return false

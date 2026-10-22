@@ -109,6 +109,7 @@ internal class StoreV2Coordinator(
     private val consumeTimeoutMillis: Long = DEFAULT_CONSUME_TIMEOUT_MILLIS,
     private val registerActiveAdapter: (StoreBillingAdapter) -> Boolean = { true },
     private val unregisterActiveAdapter: (StoreBillingAdapter) -> Unit = {},
+    private val beforeTerminal: suspend (PendingStoreOperation, StorePurchaseState) -> Boolean = { _, _ -> true },
 ) {
 
     init {
@@ -580,7 +581,7 @@ internal class StoreV2Coordinator(
                     ),
                 )
             }
-            if (!stateStore.removePendingStoreOperation(operation.id)) {
+            if (!beforeTerminal(operation, state) || !stateStore.removePendingStoreOperation(operation.id)) {
                 AppliedState.Outcome(
                     StoreV2Outcome.Failure(
                         operation = operation,

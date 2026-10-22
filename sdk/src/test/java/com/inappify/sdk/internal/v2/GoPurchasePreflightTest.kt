@@ -21,8 +21,17 @@ class GoPurchasePreflightTest {
         suspend fun pauseOnce() { if (entered.complete(Unit)) release.await() }
         suspend fun await() { withTimeout(5_000) { entered.await() } }
     }
-    private class Storage : SessionStateStore {
+    private class Storage : SessionStateStore, PurchaseAttemptStorage {
         var value: PersistedSession? = null
+        var history = "{\"version\":1,\"attempts\":[]}"
+        var failHistory = false
+        var failOperationSave = false
+        var beforeRemove: (() -> Unit)? = null
+        override suspend fun readPurchaseAttemptHistory(): String? = if (failHistory) null else history
+        override suspend fun mutatePurchaseAttemptHistory(mutation: (String) -> String): Boolean {
+            if (failHistory) return false
+            history = mutation(history); return true
+        }
         var unavailable = false
         val operations = CopyOnWriteArrayList<PendingStoreOperation>()
         override suspend fun load() = value
@@ -31,18 +40,22 @@ class GoPurchasePreflightTest {
         override suspend fun loadPendingStoreOperations() = operations.toList()
         override suspend fun loadPendingStoreRecoveryState() = if (unavailable) null else PendingStoreRecoveryState(operations.toList())
         override suspend fun upsertPendingStoreOperation(operation: PendingStoreOperation): Boolean {
+            if (failOperationSave) return false
             operations.removeAll { it.id == operation.id }; operations += operation; return true
         }
         override suspend fun removePendingStoreOperation(operationId: String): Boolean =
-            true.also { operations.removeAll { it.id == operationId } }
+            true.also { beforeRemove?.invoke(); operations.removeAll { it.id == operationId } }
     }
     private class Fixture(val market: InappifyMarket? = InappifyMarket.BAZAAR) {
         val signing = SigningFixture()
+        var clock = signing.now
         val storage = Storage()
         val sdkTransport = V2Transport()
         val commerce = V2Transport()
         val uiCalls = AtomicInteger()
         val queryCalls = AtomicInteger()
+        var lastPurchased: StorePurchase? = null
+        var ownedPurchases = emptyList<StorePurchase>()
         @Volatile var customer = signing.subject
         @Volatile var queryGate: Gate? = null
         @Volatile var queueGate: Gate? = null
@@ -51,6 +64,7 @@ class GoPurchasePreflightTest {
         @Volatile var failAck = false
         @Volatile var processing = false
         @Volatile var deliveries = "[]"
+        @Volatile var attemptStates = "[]"
         init {
             sdkTransport.handler = { request -> when (request.path) {
                 "configure", "login" -> {
@@ -69,6 +83,7 @@ class GoPurchasePreflightTest {
             commerce.handler = { request -> when {
                 request.path == "purchase" -> commerce.response(jsonObject("""{"status":true,"data":{
                     "purchaseStatus":"NEEDTOPAY","url":"https://pay.inappify.com/checkout/fixture"}}"""))
+                request.path == "purchase-attempts/status" -> commerce.response(jsonObject("""{"status":true,"data":{"attempts":$attemptStates}}"""))
                 request.path == "consumable-deliveries/pending" -> {
                     queueGate?.pauseOnce()
                     commerce.response(jsonObject("""{"status":true,"data":{"deliveries":$deliveries}}"""))
@@ -87,19 +102,21 @@ class GoPurchasePreflightTest {
                 else -> error("Unexpected commerce request ${request.path}")
             } }
         }
-        fun client() = GoV2Client(signing.config, GoApi(sdkTransport, { signing.now }, {}), storage,
+        fun client() = GoV2Client(signing.config, GoApi(sdkTransport, { clock }, {}), storage,
             AppMetadataProvider { AppMetadata("com.example.mobile", "2.4.0", 20400) },
-            { signing.now }, Dispatchers.Unconfined, backgroundRecovery = false,
-            commerceApi = GoApi(commerce, { signing.now }, {}),
+            { clock }, Dispatchers.Unconfined, backgroundRecovery = false,
+            commerceApi = GoApi(commerce, { clock }, {}),
             billingFactory = StoreBillingAdapterFactory { _, _ -> object : StoreBillingAdapter {
                 override suspend fun purchase(uiHost: StoreUiHost, request: StorePurchaseRequest): StoreBillingResult {
                     val count = uiCalls.incrementAndGet()
-                    return StoreBillingResult.Success(StorePurchase("order-$count", "token-$count", request.developerPayload!!,
-                        "com.example.mobile", request.productIdentifier, signing.now, "original-json", "signature"))
+                    val receipt = StorePurchase("order-$count", "token-$count", request.developerPayload!!,
+                        "com.example.mobile", request.productIdentifier, signing.now, "original-json", "signature")
+                    lastPurchased = receipt
+                    return StoreBillingResult.Success(receipt)
                 }
                 override suspend fun queryPurchases(productType: StoreProductType): StorePurchaseQueryResult {
                     queryCalls.incrementAndGet(); queryGate?.pauseOnce()
-                    return StorePurchaseQueryResult.Success(emptyList())
+                    return StorePurchaseQueryResult.Success(if (productType == StoreProductType.IN_APP) ownedPurchases else emptyList())
                 }
                 override fun close() = Unit
             } })
@@ -147,6 +164,232 @@ class GoPurchasePreflightTest {
                 assertEquals(listOf("store/purchases"), f.commerce.requests.map { it.path })
                 assertEquals(listOf("customerInfo"), f.sdkTransport.requests.map { it.path })
             }
+        }
+    }
+
+    @Test fun purchaseResultAndEventSurviveClientRestartWithoutRebillingOrCacheReads() = runBlocking {
+        for (market in listOf(InappifyMarket.BAZAAR, InappifyMarket.MYKET)) {
+            val f = Fixture(market)
+            val updates = mutableListOf<InappifyEvent>()
+            f.client().use { sdk ->
+                f.configure(sdk)
+                sdk.addEventListener { if (it.type == InappifyEventType.PURCHASE_UPDATED) updates += it }
+                sdk.addEventListener { if (it.type == InappifyEventType.PURCHASE_UPDATED) error("Host listener failed") }
+                val result = sdk.purchase(Activity(), f.request(attempt = "same-attempt")) as InappifyResult.Success
+                assertEquals("same-attempt", result.data.attemptId)
+                assertEquals(InappifyPurchaseAttemptStatus.SUCCEEDED, updates.last().purchaseAttempt!!.status)
+                assertEquals("same-attempt", updates.last().requestId)
+                assertEquals(result.data, updates.last().purchaseAttempt!!.purchase)
+                assertTrue(f.storage.operations.isEmpty())
+                assertFalse(f.storage.history.contains("token-1"))
+                assertFalse(f.storage.history.contains("original-json"))
+            }
+            f.client().use { restarted ->
+                f.configure(restarted)
+                val cached = restarted.snapshot
+                val persisted = f.storage.value
+                f.sdkTransport.requests.clear(); f.commerce.requests.clear()
+                val result = restarted.getPurchaseAttempt("same-attempt") as InappifyResult.Success
+                assertEquals(InappifyPurchaseAttemptStatus.SUCCEEDED, result.data!!.status)
+                assertEquals(market, result.data!!.market)
+                assertEquals("same-attempt", result.data!!.purchase!!.attemptId)
+                assertEquals(1, (restarted.getPurchaseAttempts() as InappifyResult.Success).data.size)
+                assertSame(cached, restarted.snapshot); assertSame(persisted, f.storage.value)
+                assertTrue(f.sdkTransport.requests.isEmpty()); assertTrue(f.commerce.requests.isEmpty())
+                assertEquals(1, f.uiCalls.get())
+            }
+        }
+    }
+
+    @Test fun recoveryPersistsOutcomeBeforeCheckpointRemovalAndHistoryOutlivesAnEmptySync() = runBlocking {
+        val f = Fixture()
+        f.client().use { sdk ->
+            f.configure(sdk); f.storage.operations += f.pending()
+            val updates = mutableListOf<InappifyPurchaseAttempt>()
+            sdk.addEventListener { event -> event.purchaseAttempt?.let(updates::add) }
+            f.storage.beforeRemove = { assertTrue(f.storage.history.contains("SUCCEEDED")) }
+            assertTrue(sdk.recover() is InappifyResult.Success)
+            assertTrue(f.storage.operations.isEmpty())
+            assertEquals("paid-attempt", updates.last().attemptId)
+            assertEquals(InappifyPurchaseAttemptStatus.SUCCEEDED, updates.last().status)
+            assertTrue((sdk.syncStorePurchases() as InappifyResult.Success).data.isEmpty())
+        }
+        f.client().use { restarted ->
+            f.configure(restarted)
+            val result = restarted.getPurchaseAttempt("paid-attempt") as InappifyResult.Success
+            assertEquals(InappifyPurchaseAttemptStatus.SUCCEEDED, result.data!!.status)
+            assertEquals("original", result.data!!.offeringIdentifier)
+            assertEquals("original-package", result.data!!.purchase!!.packageIdentifier)
+            assertEquals(0, f.uiCalls.get())
+        }
+    }
+
+    @Test fun uncertainVerificationRemainsPendingAcrossRestartWithoutInventingFailure() = runBlocking {
+        val f = Fixture().apply { processing = true }
+        f.client().use { sdk ->
+            f.configure(sdk); f.storage.operations += f.pending()
+            assertTrue(sdk.syncStorePurchases() is InappifyResult.Failure)
+            val value = (sdk.getPurchaseAttempt("paid-attempt") as InappifyResult.Success).data!!
+            assertFalse(value.isFinal); assertEquals(InappifyPurchaseAttemptStatus.PENDING, value.status)
+            assertNotNull(value.error)
+        }
+        f.client().use { sdk ->
+            f.configure(sdk)
+            assertEquals(InappifyPurchaseAttemptStatus.PENDING,
+                (sdk.getPurchaseAttempt("paid-attempt") as InappifyResult.Success).data!!.status)
+            f.processing = false
+            f.clock += 200_000 // Respect the checkpoint's server-directed retry delay.
+            assertTrue(sdk.syncStorePurchases() is InappifyResult.Success)
+            assertEquals(InappifyPurchaseAttemptStatus.SUCCEEDED,
+                (sdk.getPurchaseAttempt("paid-attempt") as InappifyResult.Success).data!!.status)
+            assertEquals(0, f.uiCalls.get())
+        }
+    }
+
+    @Test fun failedHistoryWriteRetainsPaidCheckpointForRecovery() = runBlocking {
+        val f = Fixture()
+        f.client().use { sdk ->
+            f.configure(sdk); f.storage.operations += f.pending(); f.storage.failHistory = true
+            assertTrue(sdk.syncStorePurchases() is InappifyResult.Failure)
+            assertEquals(1, f.storage.operations.size)
+            assertTrue(sdk.getPurchaseAttempt("paid-attempt") is InappifyResult.Failure)
+            f.storage.failHistory = false
+            assertTrue(sdk.syncStorePurchases() is InappifyResult.Success)
+            assertTrue(f.storage.operations.isEmpty())
+            assertEquals(InappifyPurchaseAttemptStatus.SUCCEEDED,
+                (sdk.getPurchaseAttempt("paid-attempt") as InappifyResult.Success).data!!.status)
+            assertEquals(0, f.uiCalls.get())
+        }
+    }
+
+    @Test fun authRejectionAndUnrelatedResponsesNeverBecomeDefinitivePurchaseFailures() = runBlocking {
+        for (response in listOf(
+            401 to """{"status":false,"code":"UNAUTHORIZED"}""",
+            200 to """{"status":true,"data":{"status":"COMPLETED","productIdentifier":"unrelated"}}""",
+        )) {
+            val f = Fixture()
+            f.client().use { sdk ->
+                f.configure(sdk); f.storage.operations += f.pending()
+                f.commerce.handler = { f.commerce.response(jsonObject(response.second), response.first) }
+                assertTrue(sdk.syncStorePurchases() is InappifyResult.Failure)
+                val tracked = (sdk.getPurchaseAttempt("paid-attempt") as InappifyResult.Success).data!!
+                assertEquals(InappifyPurchaseAttemptStatus.PENDING, tracked.status)
+                assertNull(tracked.purchase)
+                assertEquals(1, f.storage.operations.size)
+            }
+            f.client().use { sdk ->
+                f.configure(sdk)
+                assertFalse((sdk.getPurchaseAttempt("paid-attempt") as InappifyResult.Success).data!!.isFinal)
+                f.commerce.handler = { f.commerce.response(jsonObject("""{"status":true,"data":{"status":"COMPLETED"}}""")) }
+                assertTrue(sdk.syncStorePurchases() is InappifyResult.Success)
+                assertEquals(InappifyPurchaseAttemptStatus.SUCCEEDED,
+                    (sdk.getPurchaseAttempt("paid-attempt") as InappifyResult.Success).data!!.status)
+                assertEquals(0, f.uiCalls.get())
+            }
+        }
+    }
+
+    @Test fun storeReceiptRecoversOriginalAttemptAfterReceiptCheckpointWriteWasInterrupted() = runBlocking {
+        val f = Fixture()
+        f.client().use { sdk ->
+            f.configure(sdk); f.storage.failOperationSave = true
+            assertTrue(sdk.purchase(Activity(), f.request(attempt = "interrupted-attempt")) is InappifyResult.Failure)
+            assertTrue(f.storage.operations.isEmpty())
+            assertFalse((sdk.getPurchaseAttempt("interrupted-attempt") as InappifyResult.Success).data!!.isFinal)
+        }
+        f.storage.failOperationSave = false
+        f.ownedPurchases = listOf(f.lastPurchased!!)
+        f.client().use { sdk ->
+            f.configure(sdk)
+            assertTrue(sdk.syncStorePurchases() is InappifyResult.Success)
+            val tracked = (sdk.getPurchaseAttempt("interrupted-attempt") as InappifyResult.Success).data!!
+            assertEquals(InappifyPurchaseAttemptStatus.SUCCEEDED, tracked.status)
+            assertEquals("interrupted-attempt", tracked.purchase!!.attemptId)
+            assertEquals("new-offer", tracked.purchase!!.offeringIdentifier)
+            assertEquals("new-package", tracked.purchase!!.packageIdentifier)
+            assertEquals(1, f.uiCalls.get())
+        }
+    }
+
+    @Test fun lookupIsScopedToAcceptedCustomerAndUnknownIsNotFailure() = runBlocking {
+        val f = Fixture()
+        f.client().use { sdk ->
+            f.configure(sdk)
+            assertNull((sdk.getPurchaseAttempt("missing") as InappifyResult.Success).data)
+            assertTrue(sdk.purchase(Activity(), f.request(attempt = "customer-attempt")) is InappifyResult.Success)
+            assertTrue(sdk.logIn("different-customer") is InappifyResult.Success)
+            assertNull((sdk.getPurchaseAttempt("customer-attempt") as InappifyResult.Success).data)
+            assertTrue((sdk.getPurchaseAttempts() as InappifyResult.Success).data.isEmpty())
+            assertTrue(sdk.logIn(f.signing.subject) is InappifyResult.Success)
+            assertNotNull((sdk.getPurchaseAttempt("customer-attempt") as InappifyResult.Success).data)
+            assertTrue(sdk.getPurchaseAttempt("unsafe attempt") is InappifyResult.Failure)
+        }
+    }
+
+    @Test fun directPaymentAttemptIsSentAndResolvedAfterRestartWithoutAnotherCheckout() = runBlocking {
+        for (type in listOf(InappifyProductType.SUBSCRIPTION, InappifyProductType.NON_CONSUMABLE)) {
+            val f = Fixture(null)
+            f.client().use { sdk ->
+                f.configure(sdk)
+                val result = sdk.purchase(f.request(attempt = "direct-attempt", type = type)) as InappifyResult.Success
+                assertEquals("direct-attempt", result.data.attemptId)
+                assertEquals("direct-attempt", jsonObject(f.commerce.requests.single { it.path == "purchase" }.jsonBody).string("attemptId"))
+            }
+            f.attemptStates = """[{"attemptId":"direct-attempt","productIdentifier":"product","offeringIdentifier":"new-offer",
+                "status":"SUCCEEDED","purchaseStatus":"DONE","url":null,"deliveryId":null,"deliveryStatus":null}]"""
+            f.client().use { sdk ->
+                f.configure(sdk)
+                val updates = mutableListOf<InappifyPurchaseAttempt>()
+                sdk.addEventListener { event -> event.purchaseAttempt?.let(updates::add) }
+                val synced = sdk.syncStorePurchases() as InappifyResult.Success
+                assertTrue(synced.data.isEmpty()) // Existing sync return contract remains consumable-only.
+                val outcome = (sdk.getPurchaseAttempt("direct-attempt") as InappifyResult.Success).data!!
+                assertEquals(InappifyPurchaseAttemptStatus.SUCCEEDED, outcome.status)
+                assertEquals("new-package", outcome.purchase!!.packageIdentifier)
+                assertEquals("direct-attempt", updates.last().attemptId)
+                assertEquals(1, f.commerce.requests.count { it.path == "purchase" })
+                assertEquals(0, f.uiCalls.get())
+            }
+        }
+    }
+
+    @Test fun directStatusDoesNotAcceptMissingOrUnrelatedResultsAsPaymentFailure() = runBlocking {
+        val f = Fixture(null)
+        f.client().use { sdk ->
+            f.configure(sdk)
+            assertTrue(sdk.purchase(f.request(attempt = "direct-attempt")) is InappifyResult.Success)
+            assertTrue(sdk.syncStorePurchases() is InappifyResult.Success)
+            assertFalse((sdk.getPurchaseAttempt("direct-attempt") as InappifyResult.Success).data!!.isFinal)
+            f.attemptStates = """[{"attemptId":"direct-attempt","productIdentifier":"unrelated","offeringIdentifier":"new-offer",
+                "status":"SUCCEEDED","purchaseStatus":"DONE"}]"""
+            assertTrue(sdk.syncStorePurchases() is InappifyResult.Failure)
+            assertFalse((sdk.getPurchaseAttempt("direct-attempt") as InappifyResult.Success).data!!.isFinal)
+            assertEquals(1, f.commerce.requests.count { it.path == "purchase" })
+        }
+    }
+
+    @Test fun directDeliveryRecordsOriginalAttemptWhileKeepingLegacySyncResultIdentity() = runBlocking {
+        val f = Fixture(null)
+        f.client().use { sdk ->
+            f.configure(sdk)
+            assertTrue(sdk.purchase(f.request(attempt = "direct-consumable", type = InappifyProductType.CONSUMABLE)) is InappifyResult.Success)
+            f.deliveries = """[{"deliveryId":7,"productIdentifier":"product","source":"direct","status":"DELIVERY_REQUIRED",
+                "attemptId":"direct-consumable","offeringIdentifier":"new-offer"}]"""
+            sdk.syncStorePurchases()
+            val pending = (sdk.getPurchaseAttempt("direct-consumable") as InappifyResult.Success).data!!
+            assertFalse(pending.isFinal); assertEquals(7L, pending.purchase!!.deliveryId)
+            f.commerce.handler = { request -> when (request.path) {
+                "consumable-deliveries/7/delivered" -> f.commerce.response(jsonObject("""{"status":true,"data":{
+                    "deliveryId":7,"productIdentifier":"product","source":"direct","status":"COMPLETED","alreadyDelivered":true,
+                    "attemptId":"direct-consumable","offeringIdentifier":"new-offer"}}"""))
+                else -> error("Unexpected request")
+            } }
+            val acknowledged = sdk.confirmDeliveryV2(7) as InappifyResult.Success
+            assertEquals("direct-delivery-7", acknowledged.data.attemptId)
+            val complete = (sdk.getPurchaseAttempt("direct-consumable") as InappifyResult.Success).data!!
+            assertEquals(InappifyPurchaseAttemptStatus.SUCCEEDED, complete.status)
+            assertEquals("direct-consumable", complete.purchase!!.attemptId)
+            assertEquals("new-package", complete.purchase!!.packageIdentifier)
         }
     }
 

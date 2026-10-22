@@ -13,6 +13,7 @@ public class InappifyEvent private constructor(
     public val type: InappifyEventType,
     public val snapshot: InappifySnapshot,
     public val requestId: String?,
+    public val purchaseAttempt: InappifyPurchaseAttempt?,
 ) {
 
     /** Returns diagnostics without customer state or correlation data. */
@@ -27,10 +28,12 @@ public class InappifyEvent private constructor(
             type: InappifyEventType,
             snapshot: InappifySnapshot,
             requestId: String? = null,
+            purchaseAttempt: InappifyPurchaseAttempt? = null,
         ): InappifyEvent = InappifyEvent(
             type = type,
             snapshot = snapshot,
             requestId = requestId.toSafeRequestId(),
+            purchaseAttempt = purchaseAttempt,
         )
 
         private fun String?.toSafeRequestId(): String? =

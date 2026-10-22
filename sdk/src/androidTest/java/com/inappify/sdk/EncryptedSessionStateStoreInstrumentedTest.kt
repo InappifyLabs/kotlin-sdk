@@ -10,6 +10,7 @@ import com.inappify.sdk.internal.storage.PendingStoreOperationType
 import com.inappify.sdk.internal.storage.PendingStoreProductType
 import com.inappify.sdk.internal.storage.PendingStorePurchaseEvidence
 import com.inappify.sdk.internal.storage.PersistedSession
+import com.inappify.sdk.internal.storage.PurchaseAttemptHistory
 import com.inappify.sdk.internal.storage.RejectedStoreEvidenceTombstone
 import com.inappify.sdk.internal.storage.SessionSaveResult
 import com.inappify.sdk.internal.storage.SessionStorageStage
@@ -57,6 +58,37 @@ class EncryptedSessionStateStoreInstrumentedTest {
         storageLockFile().delete()
         migrationMarker().delete()
         legacyPreferences().edit().clear().commit()
+    }
+
+    @Test
+    fun encryptedPurchaseHistorySurvivesRecreationAndSessionClearWithoutChangingSessionBytes() = runBlocking {
+        val file = File(context.noBackupFilesDir, "inappify_purchase_attempts_v1.bin")
+        try {
+            assertTrue(store.save(persistedSession()))
+            val originalSession = sessionFile().readBytes()
+            val purchase = InappifyPurchase.storeResult("durable-attempt", "product", "offer", "pkg",
+                InappifyStorePurchaseStatus.COMPLETED, 7L, 9L, false)
+            val binding = "a".repeat(64)
+            assertTrue(PurchaseAttemptHistory(store).put(binding, InappifyPurchaseAttempt("durable-attempt", "product", "offer",
+                InappifyMarket.BAZAAR, InappifyPurchaseAttemptStatus.SUCCEEDED, purchase, null, 123L)))
+            assertTrue(originalSession.contentEquals(sessionFile().readBytes()))
+            assertFalse(file.readBytes().containsSubsequence("durable-attempt".encodeToByteArray()))
+            assertFalse(file.readBytes().containsSubsequence("product".encodeToByteArray()))
+            val recreated = EncryptedSessionStateStore.create(context)
+            assertEquals(purchase, PurchaseAttemptHistory(recreated).list(binding).single().purchase)
+            assertTrue(recreated.clear())
+            assertEquals(purchase, PurchaseAttemptHistory(EncryptedSessionStateStore.create(context)).list(binding).single().purchase)
+            val corrupt = file.readBytes().also { it[it.lastIndex] = (it.last().toInt() xor 1).toByte() }
+            file.writeBytes(corrupt)
+            assertNull(recreated.readPurchaseAttemptHistory())
+            assertFalse(recreated.mutatePurchaseAttemptHistory { "{\"version\":1,\"attempts\":[]}" })
+            assertTrue(corrupt.contentEquals(file.readBytes()))
+        } finally {
+            // Only the new file in this instrumentation application's sandbox is test-owned.
+            file.delete()
+            File(file.path + ".bak").delete()
+            File(file.path + ".new").delete()
+        }
     }
 
     @Test

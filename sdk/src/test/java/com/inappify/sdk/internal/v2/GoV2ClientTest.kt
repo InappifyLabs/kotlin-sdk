@@ -22,7 +22,7 @@ class GoV2ClientTest {
             assertTrue(sdk.purchase(InappifyPurchaseRequest("product", "default")) is InappifyResult.Success)
             val request = transport.requests.last { it.path == "purchase" }
             assertEquals("Bearer go-session-token", request.headers["Authorization"])
-            assertEquals(setOf("productIdentifier", "offeringIdentifier", "paymentReturnVersion"), jsonObject(request.jsonBody).keySet())
+            assertEquals(setOf("productIdentifier", "offeringIdentifier", "attemptId", "paymentReturnVersion"), jsonObject(request.jsonBody).keySet())
         }
     }
     private val signing = SigningFixture()
@@ -48,6 +48,7 @@ class GoV2ClientTest {
                 "customerInfo" -> transport.response(signing.envelope(identity))
                 "offerings" -> transport.response(jsonObject("""{"status":true,"offerings":[{"identifier":"default","isDefault":true},{"identifier":"targeted"}],"currentOffering":"targeted","placements":{"onboarding":"default","settings":null}}"""))
                 "consumable-deliveries/pending" -> transport.response(jsonObject("""{"status":true,"data":{"deliveries":[]}}"""))
+                "purchase-attempts/status" -> transport.response(jsonObject("""{"status":true,"data":{"attempts":[]}}"""))
                 "purchase" -> transport.response(jsonObject("""{"status":true,"data":{"purchaseStatus":"DONE"}}"""))
                 "attributes" -> TransportResult.Response(HttpResponse(204, null, null))
                 "validateDiscountCode" -> transport.response(jsonObject("""{"status":true,"data":{"is_valid":false,"error_code":2,"code":"","discount_id":0,"discount_code_id":0,"percent":0,"message":"Invalid","payment_links":[]}}"""))
@@ -857,7 +858,7 @@ class GoV2ClientTest {
             assertNull(purchase.data.deliveryId)
             val checkout = transport.requests.single { it.path == "purchase" }
             assertEquals("Bearer go-session-token", checkout.headers["Authorization"])
-            assertEquals(setOf("productIdentifier", "offeringIdentifier", "paymentReturnVersion"),
+            assertEquals(setOf("productIdentifier", "offeringIdentifier", "attemptId", "paymentReturnVersion"),
                 jsonObject(checkout.jsonBody).keySet())
             assertEquals(1, jsonObject(checkout.jsonBody).get("paymentReturnVersion").asInt)
             assertFalse(jsonObject(checkout.jsonBody).has("isCrypto"))
@@ -869,7 +870,7 @@ class GoV2ClientTest {
             val sync = sdk.syncPendingConsumables() as InappifyResult.Success
             assertEquals(0, sync.data.discoveredCount)
             val pending = transport.requests.single { it.path == "consumable-deliveries/pending" }
-            assertEquals("{}", pending.jsonBody)
+            assertEquals(1L, jsonObject(pending.jsonBody).number("purchaseAttemptTrackingVersion"))
             assertEquals("Bearer go-session-token", pending.headers["Authorization"])
         }
     }
@@ -898,8 +899,9 @@ class GoV2ClientTest {
             val request = transport.requests.single { it.path == "purchase" }
             assertEquals("Bearer go-session-token", request.headers["Authorization"])
             val body = jsonObject(request.jsonBody)
-            assertEquals(setOf("productIdentifier", "offeringIdentifier", "paymentReturnVersion", "paywallId", "paywallRevision"),
+            assertEquals(setOf("productIdentifier", "offeringIdentifier", "attemptId", "paymentReturnVersion", "paywallId", "paywallRevision"),
                 body.keySet())
+            assertEquals("direct-attempt", body.string("attemptId"))
             assertEquals("default", body.string("offeringIdentifier"))
             assertFalse(body.has("isCrypto"))
             assertEquals(8L, body.number("paywallId"))
