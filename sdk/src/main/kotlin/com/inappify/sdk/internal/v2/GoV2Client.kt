@@ -946,8 +946,6 @@ internal class GoV2Client(
                 request.isCrypto || request.discount != 0L || request.discountCode != null ||
                 request.paywallId != null || request.paywallRevision != null)
                 fail("VALIDATION", "PURCHASE_OVERRIDE_NOT_ALLOWED")
-            if (market == InappifyMarket.MYKET && request.productType == InappifyProductType.SUBSCRIPTION)
-                fail("CONFIGURATION", "MYKET_SUBSCRIPTIONS_UNSUPPORTED")
         } else if (snapshot.storePlatform == "DirectAndroid" && (request.country != null || request.appVersion != null ||
                 request.market != InappifyMarket.NONE || request.discount != 0L || request.discountCode != null))
             fail("VALIDATION", "PURCHASE_OVERRIDE_NOT_ALLOWED")
@@ -1120,8 +1118,6 @@ internal class GoV2Client(
         val coordinator = storeCoordinator ?: fail("CONFIGURATION", "LARAVEL_V2_NOT_CONFIGURED")
         val context = storeContext()
         if (context.marketKey.isNullOrBlank()) fail("CONFIGURATION", if (context.market == InappifyMarket.MYKET) "MYKET_PUBLIC_KEY_REQUIRED" else "BAZAAR_PUBLIC_KEY_REQUIRED")
-        if (context.market == InappifyMarket.MYKET && request.productType == InappifyProductType.SUBSCRIPTION)
-            fail("CONFIGURATION", "MYKET_SUBSCRIPTIONS_UNSUPPORTED")
         val attemptId = request.idempotencyKey ?: UUID.randomUUID().toString()
         if (!attemptId.matches(Regex("[A-Za-z0-9_.:-]{1,128}"))) fail("VALIDATION", "PURCHASE_ATTEMPT_INVALID")
         val recovery = storage.loadPendingStoreRecoveryState() ?: fail("STORAGE", "STORE_RECOVERY_UNAVAILABLE")
@@ -1161,7 +1157,7 @@ internal class GoV2Client(
         val receipt = try {
             when (val billed = adapter.purchase(StoreUiHost.from(host), StorePurchaseRequest(
                 request.productIdentifier,
-                if (request.productType == InappifyProductType.SUBSCRIPTION) StoreProductType.SUBSCRIPTION
+                if (context.market == InappifyMarket.BAZAAR && request.productType == InappifyProductType.SUBSCRIPTION) StoreProductType.SUBSCRIPTION
                 else StoreProductType.IN_APP, developerPayload))) {
                 is StoreBillingResult.Success -> billed.purchase
                 is StoreBillingResult.Cancelled -> throw V2Failure(InappifyError(InappifyErrorCode.PURCHASE_CANCELLED,
@@ -1297,7 +1293,7 @@ internal class GoV2Client(
             it.customerIdentifierFingerprint == context.customerIdentifierFingerprint &&
             it.appId == context.appId && it.appIdentifier == context.appIdentifier }) {
             val purchaseTime = pending.evidence.purchaseTimeMillis
-            if (pending.productType == PendingStoreProductType.SUBSCRIPTION && purchaseTime != null)
+            if (context.market == InappifyMarket.BAZAAR && pending.productType == PendingStoreProductType.SUBSCRIPTION && purchaseTime != null)
                 knownSubscriptionReceipts += pending.evidence.purchaseToken to purchaseTime
             else knownTokens += pending.evidence.purchaseToken
             if (storeTombstone(pending, context) in recovery.rejectedEvidenceTombstones) {
@@ -1376,7 +1372,8 @@ internal class GoV2Client(
                                 val compatibleType = when (storeType) {
                                     StoreProductType.SUBSCRIPTION -> resolvedType == InappifyProductType.SUBSCRIPTION.name
                                     StoreProductType.IN_APP -> resolvedType == null || resolvedType in setOf(
-                                        InappifyProductType.CONSUMABLE.name, InappifyProductType.NON_CONSUMABLE.name)
+                                        InappifyProductType.CONSUMABLE.name, InappifyProductType.NON_CONSUMABLE.name) ||
+                                        (context.market == InappifyMarket.MYKET && resolvedType == InappifyProductType.SUBSCRIPTION.name)
                                 }
                                 if (!compatibleType || (!unboundSubscription &&
                                         (payloadProduct != receipt.productIdentifier || offeringId.isNullOrBlank())) ||
@@ -1409,7 +1406,8 @@ internal class GoV2Client(
                                 // Pending journals above must still finish delivery/consume checkpoints.
                                 // A renewed subscription may retain its token but change its purchase time.
                                 val purchaseRefHash = digest(receipt.purchaseToken)
-                                if (!explicitRestore && resolvedType in setOf(
+                                if (!explicitRestore && !(context.market == InappifyMarket.MYKET &&
+                                        resolvedType == InappifyProductType.SUBSCRIPTION.name) && resolvedType in setOf(
                                         InappifyProductType.NON_CONSUMABLE.name, InappifyProductType.SUBSCRIPTION.name) &&
                                     confirmedCustomerInfo?.entitlements.orEmpty().any {
                                         it.purchaseStoreRefHash == purchaseRefHash &&
@@ -1417,7 +1415,8 @@ internal class GoV2Client(
                                     }) continue
                                 // Never restore a consumable merely because it appears in owned inventory.
                                 if (explicitRestore && pendingType == PendingStoreProductType.LEGACY_IN_APP &&
-                                    declaredType != InappifyProductType.NON_CONSUMABLE.name) continue
+                                    declaredType != InappifyProductType.NON_CONSUMABLE.name &&
+                                    !(context.market == InappifyMarket.MYKET && declaredType == InappifyProductType.SUBSCRIPTION.name)) continue
                                 // Locally verified receipts outlive catalog changes. Forward their
                                 // original bound offering; only the server can accept the payment.
                                 // Explicit restore never grants consumables from owned inventory.

@@ -3,6 +3,7 @@ package com.inappify.sdk.internal.v2
 import com.google.gson.JsonObject
 import com.inappify.sdk.*
 import com.inappify.sdk.internal.billing.*
+import com.inappify.sdk.internal.billing.StoreConsumeResult
 import com.inappify.sdk.internal.network.*
 import com.inappify.sdk.internal.platform.*
 import com.inappify.sdk.internal.storage.*
@@ -27,6 +28,7 @@ class GoCommerceRegressionTest(private val nativeMarket: InappifyMarket) {
     private val owned = mutableMapOf<StoreProductType, List<StorePurchase>>()
     private var freshPurchase: ((StorePurchaseRequest) -> StoreBillingResult)? = null
     private var billingCalls = 0
+    private var consumeCalls = 0
     private var billingKey: String? = null
     private var platform = if (nativeMarket == InappifyMarket.MYKET) 11 else 10
     private val metadata = AppMetadataProvider { AppMetadata("com.example.mobile", "2.4.0", 20400) }
@@ -58,6 +60,10 @@ class GoCommerceRegressionTest(private val nativeMarket: InappifyMarket) {
                         StorePurchaseQueryResult.Success(owned[productType].orEmpty()).also {
                             if (nativeMarket == InappifyMarket.MYKET) assertEquals(StoreProductType.IN_APP, productType)
                         }
+                    override suspend fun consume(purchase: StorePurchase): StoreConsumeResult {
+                        consumeCalls++
+                        return StoreConsumeResult.Success
+                    }
                     override fun close() = Unit
                 }
             })
@@ -126,26 +132,23 @@ class GoCommerceRegressionTest(private val nativeMarket: InappifyMarket) {
         }
     }
 
-    @Test fun packageSubscriptionUsesBazaarSubscriptionBillingAndPreservesMyketRejection() = runBlocking {
+    @Test fun packageSubscriptionUsesStoreSpecificBillingAndMyketConsumesAfterServerGrant() = runBlocking {
         freshPurchase = { request ->
-            assertEquals(StoreProductType.SUBSCRIPTION, request.productType)
+            assertEquals(if (nativeMarket == InappifyMarket.MYKET) StoreProductType.IN_APP else StoreProductType.SUBSCRIPTION, request.productType)
+            assertEquals("SUBSCRIPTION", jsonObject(request.developerPayload!!).string("productType"))
+            assertEquals(0, consumeCalls)
             successfulReceipt(request)
         }
         client().use { sdk ->
+            authorizeSubscriptionConsumption()
             installTypedCatalog("SUBSCRIPTION")
             configured(sdk)
             val selected = sdk.snapshot.offerings!!["original"]!!.availablePackages.single()
             val result = sdk.purchase(InappifyPurchaseParams.Builder(android.app.Activity(), selected).build())
-            if (nativeMarket == InappifyMarket.MYKET) {
-                assertEquals("MYKET_SUBSCRIPTIONS_UNSUPPORTED",
-                    (result as InappifyResult.Failure).error.details["serverCode"])
-                assertEquals(0, billingCalls)
-                assertTrue(commerceTransport.requests.isEmpty())
-            } else {
-                assertTrue(result.toString(), result is InappifyResult.Success)
-                assertEquals(1, billingCalls)
-                assertEquals("store/purchases", commerceTransport.requests.single().path)
-            }
+            assertTrue(result.toString(), result is InappifyResult.Success)
+            assertEquals(if (nativeMarket == InappifyMarket.MYKET) 1 else 0, consumeCalls)
+            assertEquals("store/purchases", commerceTransport.requests.single().path)
+            assertTrue(storage.operations.isEmpty())
         }
     }
 
@@ -274,15 +277,40 @@ class GoCommerceRegressionTest(private val nativeMarket: InappifyMarket) {
             assertEquals(1, storage.operations.size)
         }
     }
-    @Test fun myketRejectsSubscriptionBeforeBillingOrCommerce() = runBlocking {
+    @Test fun myketSubscriptionAgainstOldBackendRetainsReceiptWithoutConsuming() = runBlocking {
+        if (nativeMarket != InappifyMarket.MYKET) return@runBlocking
+        freshPurchase = ::successfulReceipt
+        client().use { sdk ->
+            configured(sdk)
+            val result = sdk.purchase(android.app.Activity(), InappifyPurchaseRequest("product", "original",
+                productType = InappifyProductType.SUBSCRIPTION)) as InappifyResult.Failure
+            assertEquals(InappifyErrorCode.MALFORMED_RESPONSE, result.error.code)
+            assertEquals(0, consumeCalls)
+            assertEquals(1, commerceTransport.requests.size)
+            assertEquals(1, storage.operations.size)
+        }
+    }
+
+    private fun authorizeSubscriptionConsumption() {
+        commerceTransport.handler = { commerceTransport.response(jsonObject(
+            """{"status":true,"data":{"purchase":{"status":"COMPLETED","paymentId":11,"eventId":12,
+                "requiresConsumption":${nativeMarket == InappifyMarket.MYKET}}}}""")) }
+    }
+
+    @Test fun myketOwnedSubscriptionRecoversFromInAppInventoryWithoutHostDelivery() = runBlocking {
         if (nativeMarket != InappifyMarket.MYKET) return@runBlocking
         client().use { sdk ->
             configured(sdk)
-            val result = sdk.purchase(InappifyPurchaseRequest("product", "original",
-                productType = InappifyProductType.SUBSCRIPTION)) as InappifyResult.Failure
-            assertEquals("MYKET_SUBSCRIPTIONS_UNSUPPORTED", result.error.details["serverCode"])
-            assertEquals(0, billingCalls)
-            assertTrue(commerceTransport.requests.isEmpty())
+            authorizeSubscriptionConsumption()
+            owned[StoreProductType.IN_APP] = listOf(receipt(type = "SUBSCRIPTION"))
+            // Inventory's adapter is released before a pending consumption retry.
+            sdk.syncStorePurchases()
+            owned.clear()
+            storage.operations.toList().forEach { storage.upsertPendingStoreOperation(it.copy(nextRetryAtEpochMillis = null)) }
+            sdk.syncStorePurchases()
+            assertEquals(1, consumeCalls)
+            assertTrue(storage.operations.isEmpty())
+            assertTrue(commerceTransport.requests.all { it.path == "store/purchases" })
         }
     }
 

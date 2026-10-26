@@ -1,6 +1,6 @@
 # Getting started
 
-This guide uses `com.github.InappifyLabs:kotlin-sdk:v0.2.1` and the public
+This guide uses `com.github.InappifyLabs:kotlin-sdk:v0.2.2` and the public
 Kotlin package `com.inappify.sdk`. Follow [installation](../README.md#install)
 first. All SDK operations below are suspend functions unless stated otherwise.
 
@@ -17,7 +17,7 @@ is an Inappify catalog identifier, not the Android application ID.
 | Myket | Server session | Myket app public RSA key, installed Myket, signed-in store account; consumable and non-consumable in-app products |
 | Direct | Server session | Inappify Direct Android route and permitted checkout provider |
 
-Myket subscriptions are unsupported. The SDK includes Poolakey for Bazaar and
+Myket timed subscriptions use consumable in-app SKUs with server-managed duration and manual renewal; see [Stores](STORES.md). The SDK includes Poolakey for Bazaar and
 an isolated Myket billing implementation. Their merged manifests supply store
 permissions, package visibility and Myket components. Inspect the final merged
 manifest for your app. You do not add another billing helper or relay
@@ -163,7 +163,7 @@ suspend fun offeringForPaywall(
 
 Fresh offerings requests flush the durable attribute queue first. The server
 performs targeting using the current session, queued attributes, country,
-appVersion and SDK version `0.2.1`. Configure/snapshots use this exact
+appVersion and SDK version `0.2.2`. Configure/snapshots use this exact
 version without the tag prefix; the client does not
 normalize it locally for selection. SDK version is separate from your app
 version. Current selection uses a matching placement offering, then the server's

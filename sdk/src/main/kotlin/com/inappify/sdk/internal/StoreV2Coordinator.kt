@@ -581,6 +581,39 @@ internal class StoreV2Coordinator(
                     ),
                 )
             }
+            // Myket sells a timed entitlement as an ordinary, repeatable in-app item.
+            // Only the server's committed grant authorizes consumption; the signed
+            // developer payload alone never authorizes consuming a user's purchase.
+            if (operation.store == "myket" && operation.productType == PendingStoreProductType.SUBSCRIPTION) {
+                if (state.requiresConsumption != true || state.paymentId == null || state.eventId == null) {
+                    return AppliedState.Outcome(permanentFailure(operation,
+                        InappifyErrorCode.MALFORMED_RESPONSE,
+                        "The server did not authorize consumption of the Myket subscription receipt.", remove = false))
+                }
+                if (operation.consumeResult != PendingStoreConsumeResult.SUCCEEDED) {
+                    val result = consume(operation, context)
+                    val failure = when (result) {
+                        StoreConsumeResult.Success -> null
+                        is StoreConsumeResult.RetryableFailure -> result.error
+                        is StoreConsumeResult.PermanentFailure -> result.error
+                    }
+                    // A lost callback/process can leave a successfully consumed token
+                    // in our journal. The entitlement is already committed above.
+                    if (failure != null && failure.code != StoreBillingErrorCode.ITEM_NOT_OWNED) {
+                        val error = InappifyError(InappifyErrorCode.PURCHASE_VERIFICATION_FAILED,
+                            "The entitlement is granted, but Myket receipt consumption is pending.",
+                            isRetryable = failure.isRetryable,
+                            details = operation.safeDetails(context) + mapOf("outcomeMayHaveCommitted" to true))
+                        return AppliedState.Outcome(if (failure.isRetryable) defer(operation, error, state)
+                            else StoreV2Outcome.Failure(operation, error, retainedForRetry = true))
+                    }
+                    val consumed = operation.copy(consumeResult = PendingStoreConsumeResult.SUCCEEDED,
+                        consumeErrorCode = null, updatedAtEpochMillis = currentTimeMillis())
+                    if (!stateStore.upsertPendingStoreOperation(consumed))
+                        return AppliedState.Outcome(storageFailure(operation))
+                    return applyState(consumed, state, context)
+                }
+            }
             if (!beforeTerminal(operation, state) || !stateStore.removePendingStoreOperation(operation.id)) {
                 AppliedState.Outcome(
                     StoreV2Outcome.Failure(
@@ -937,6 +970,8 @@ internal class StoreV2Coordinator(
                 val received = requireNotNull(payload.state)
                 val wrongScope = (operation.operation == PendingStoreOperationType.RECOVER_SUBSCRIPTION &&
                     (received.source != operation.store || received.productIdentifier != operation.productIdentifier)) ||
+                    (received.requiresConsumption == true && (operation.store != "myket" ||
+                        operation.productType != PendingStoreProductType.SUBSCRIPTION)) ||
                     (received.source != null && received.source != operation.store) ||
                     (received.productIdentifier != null && received.productIdentifier != operation.productIdentifier) ||
                     (received.verificationRequestId != null && operation.verificationRequestId != null &&

@@ -1,3 +1,8 @@
+## 0.2.2
+
+- Support manually renewed Myket timed subscriptions using IN_APP purchases and server-authorized consumption after entitlement grant. Preserve consumable host delivery, lifetime ownership, Bazaar subscriptions and Direct behavior.
+- Recover bound subscription receipts from Myket in-app inventory and checkpoint consumption for retries/process death without duplicate grants. Require the matching V2 commerce backend; native/automatic Myket subscriptions remain unavailable.
+
 # Changelog
 
 ## 0.2.1

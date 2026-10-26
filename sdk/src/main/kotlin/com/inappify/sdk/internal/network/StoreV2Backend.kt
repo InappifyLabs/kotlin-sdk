@@ -118,6 +118,8 @@ internal class StorePurchaseState(
     internal val source: String? = null,
     internal val productIdentifier: String? = null,
     internal val alreadyDelivered: Boolean? = null,
+    /** Server authorization to consume a Myket receipt after granting its timed entitlement. */
+    internal val requiresConsumption: Boolean? = null,
 ) {
     override fun toString(): String =
         "StorePurchaseState(" +

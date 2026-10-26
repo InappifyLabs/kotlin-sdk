@@ -47,6 +47,84 @@ import com.inappify.sdk.internal.billing.storeId
 @RunWith(Parameterized::class)
 class StoreV2CoordinatorTest(private val market: InappifyMarket) {
 
+    @Test fun subscriptionConsumesOnlyForMyketAfterAuthoritativeGrant() = runBlocking {
+        for (status in listOf(StorePurchaseStatus.COMPLETED, StorePurchaseStatus.RESTORED, StorePurchaseStatus.ALREADY_PROCESSED)) {
+            val fixture = fixture()
+            fixture.service.submitResults += response(status, requiresConsumption = market == InappifyMarket.MYKET)
+            fixture.billing.consumeResults += StoreConsumeResult.Success
+            val outcome = fixture.coordinator.submit(operation(productType = PendingStoreProductType.SUBSCRIPTION), context())
+            assertTrue(outcome is StoreV2Outcome.Terminal)
+            assertEquals(if (market == InappifyMarket.MYKET) listOf(EVENT_SUBMIT, EVENT_CONSUME) else listOf(EVENT_SUBMIT), fixture.events)
+            assertEquals(0, fixture.stateStore.operationCount)
+        }
+    }
+
+    @Test fun subscriptionConsumptionRequiresExplicitServerAuthorizationAndCorrectProduct() = runBlocking {
+        val fixture = fixture()
+        fixture.service.submitResults += response(StorePurchaseStatus.COMPLETED, requiresConsumption = true)
+        assertFalse(fixture.coordinator.submit(operation(productType = PendingStoreProductType.NON_CONSUMABLE), context()) is StoreV2Outcome.Terminal)
+        assertEquals(0, fixture.billing.consumeCalls)
+        if (market == InappifyMarket.MYKET) {
+            for (flag in listOf(null, false)) {
+                val older = fixture()
+                older.service.submitResults += response(StorePurchaseStatus.COMPLETED, requiresConsumption = flag)
+                assertTrue(older.coordinator.submit(operation(productType = PendingStoreProductType.SUBSCRIPTION), context()) is StoreV2Outcome.Failure)
+                assertEquals(0, older.billing.consumeCalls)
+                assertEquals(1, older.stateStore.operationCount)
+            }
+        }
+    }
+
+    @Test fun myketSubscriptionConsumeRetryReverifiesWithoutGrantingOrHostDelivery() = runBlocking {
+        if (market != InappifyMarket.MYKET) return@runBlocking
+        val fixture = fixture()
+        fixture.service.submitResults += response(StorePurchaseStatus.COMPLETED, requiresConsumption = true)
+        fixture.billing.consumeResults += StoreConsumeResult.RetryableFailure(StoreBillingError(
+            StoreBillingErrorCode.CONNECTION_FAILED, "offline", true))
+        val first = fixture.coordinator.submit(operation(productType = PendingStoreProductType.SUBSCRIPTION), context())
+        assertTrue(first is StoreV2Outcome.Deferred)
+        assertEquals(1, fixture.stateStore.operationCount)
+        fixture.clock.now += 120_000
+        fixture.service.submitResults += response(StorePurchaseStatus.ALREADY_PROCESSED, requiresConsumption = true)
+        // Simulates a successful consume whose callback was lost before persistence.
+        fixture.billing.consumeResults += StoreConsumeResult.RetryableFailure(StoreBillingError(
+            StoreBillingErrorCode.ITEM_NOT_OWNED, "already consumed", true))
+        assertTrue(fixture.coordinator.resume(fixture.stateStore.latestOperation(), context()) is StoreV2Outcome.Terminal)
+        assertEquals(listOf(EVENT_SUBMIT, EVENT_CONSUME, EVENT_SUBMIT, EVENT_CONSUME), fixture.events)
+        assertEquals(0, fixture.stateStore.operationCount)
+    }
+
+    @Test fun myketConsumedCheckpointSurvivesFinalizationFailureWithoutConsumingAgain() = runBlocking {
+        if (market != InappifyMarket.MYKET) return@runBlocking
+        val fixture = fixture()
+        fixture.stateStore.removeSucceeds = false
+        fixture.service.submitResults += response(StorePurchaseStatus.COMPLETED, requiresConsumption = true)
+        fixture.billing.consumeResults += StoreConsumeResult.Success
+        assertTrue(fixture.coordinator.submit(operation(productType = PendingStoreProductType.SUBSCRIPTION), context()) is StoreV2Outcome.Failure)
+        assertEquals(PendingStoreConsumeResult.SUCCEEDED, fixture.stateStore.latestConsumeResult)
+        fixture.stateStore.removeSucceeds = true
+        fixture.service.submitResults += response(StorePurchaseStatus.ALREADY_PROCESSED, requiresConsumption = true)
+        assertTrue(fixture.coordinator.resume(fixture.stateStore.latestOperation(), context()) is StoreV2Outcome.Terminal)
+        assertEquals(1, fixture.billing.consumeCalls)
+    }
+
+    @Test fun subscriptionPollingConsumesOnlyAfterCommittedStatus() = runBlocking {
+        val fixture = fixture()
+        fixture.service.submitResults += response(StorePurchaseStatus.PROCESSING, verificationRequestId = VERIFICATION_ID)
+        fixture.service.statusResults += response(StorePurchaseStatus.COMPLETED, requiresConsumption = market == InappifyMarket.MYKET)
+        fixture.billing.consumeResults += StoreConsumeResult.Success
+        assertTrue(fixture.coordinator.submit(operation(productType = PendingStoreProductType.SUBSCRIPTION), context()) is StoreV2Outcome.Terminal)
+        assertEquals(if (market == InappifyMarket.MYKET) listOf(EVENT_SUBMIT, EVENT_STATUS, EVENT_CONSUME)
+            else listOf(EVENT_SUBMIT, EVENT_STATUS), fixture.events)
+    }
+
+    @Test fun rejectedSubscriptionNeverConsumes() = runBlocking {
+        val fixture = fixture()
+        fixture.service.submitResults += response(StorePurchaseStatus.REJECTED)
+        assertTrue(fixture.coordinator.submit(operation(productType = PendingStoreProductType.SUBSCRIPTION), context()) is StoreV2Outcome.Rejected)
+        assertEquals(0, fixture.billing.consumeCalls)
+    }
+
     @Test
     fun wrongStoreCannotSubmitResumeOrConsume() = runBlocking {
         val fixture = fixture()
@@ -1010,20 +1088,22 @@ class StoreV2CoordinatorTest(private val market: InappifyMarket) {
         message: String? = null,
         httpStatus: Int = 200,
         transportRetryAfter: Long? = null,
+        requiresConsumption: Boolean? = null,
     ): StoreServiceResult = StoreServiceResult.Response(
         statusCode = httpStatus,
         payload = StoreBackendResponse(
             status = true,
             state = StorePurchaseState(
                 status = status,
-                paymentId = null,
-                eventId = null,
+                paymentId = if (requiresConsumption == true) 11L else null,
+                eventId = if (requiresConsumption == true) 12L else null,
                 deliveryId = deliveryId,
                 verificationRequestId = verificationRequestId,
                 retryAfter = retryAfterSeconds,
                 errorCode = errorCode,
                 message = message,
                 alreadyProcessed = false,
+                requiresConsumption = requiresConsumption,
             ),
             errorCode = null,
             message = null,

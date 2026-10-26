@@ -37,6 +37,7 @@ class GoV2StoreServiceTest {
     }
     @Test fun rejectsMalformedOptionalFlagsAndScopeInsteadOfErasingThem() = runBlocking {
         for (field in listOf("\"alreadyDelivered\":\"false\"", "\"alreadyProcessed\":1",
+            "\"requiresConsumption\":\"true\"", "\"requiresConsumption\":1",
             "\"productIdentifier\":12", "\"source\":true", "\"retryAfter\":-1", "\"retryAfter\":0.5")) {
             assertTrue(status("""{"status":"DELIVERY_REQUIRED","deliveryId":7,$field}""") is StoreServiceResult.Failure)
         }

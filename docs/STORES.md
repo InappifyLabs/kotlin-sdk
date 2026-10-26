@@ -5,10 +5,10 @@ The SDK provides Android billing adapters for Cafe Bazaar and Myket. A store rec
 | Session store platform | Products supported by this SDK | Owned inventory queried |
 | --- | --- | --- |
 | `Bazar` | Consumable, non-consumable, subscription | Bazaar subscriptions, then in-app purchases |
-| `MyKet` | Consumable, non-consumable | Myket in-app purchases |
+| `MyKet` | Consumable, non-consumable, manually renewed timed subscription | Myket in-app purchases |
 | `DirectAndroid` | Server checkout; no native store UI | Server delivery queue |
 
-These native adapters run on Android. They do not implement iOS billing, Google Play Billing, or App Store billing. Myket subscriptions are unsupported by this SDK and are rejected before launching billing.
+These native adapters run on Android. They do not implement iOS billing, Google Play Billing, or App Store billing. Myket timed subscriptions use ordinary in-app purchases, with duration and manual renewal managed by Inappify. They are not native/auto-renewing Myket subscriptions.
 
 ## Install and configure the store application
 
@@ -100,7 +100,7 @@ suspend fun buyStoreSubscription(
 | --- | --- | --- |
 | `CONSUMABLE` | `purchaseProduct` / `IN_APP` | In-app purchase | Verified host delivery, acknowledgement, then consumption |
 | `NON_CONSUMABLE` | `purchaseProduct` / `IN_APP` | In-app purchase | Server-confirmed ownership; no consumption |
-| `SUBSCRIPTION` | `subscribeProduct` / `SUBSCRIPTION` | Unsupported | Server-confirmed entitlement; no consumption |
+| `SUBSCRIPTION` | `subscribeProduct` / `SUBSCRIPTION` | `IN_APP`; consume only after server grant authorization | Server-confirmed entitlement; only Myket consumes |
 
 The package-based API requires a known `product.productType` for native stores.
 Missing or unknown metadata returns `PRODUCT_TYPE_REQUIRED` before opening the
@@ -124,7 +124,7 @@ A successful result may be `COMPLETED`, `RESTORED`, `ALREADY_PROCESSED`, or `DEL
 
 An explicit store cancellation maps to `PURCHASE_CANCELLED`. Connection loss, Activity destruction, timeout, invalid receipt data, or a lost callback can leave the payment outcome uncertain. Check `error.details["outcomeMayHaveCommitted"]`, keep the same logical attempt, and run recovery instead of immediately asking the customer to pay again. A coroutine `CancellationException` is cancellation of SDK work, not proof that the store reversed a payment.
 
-Useful failure details include `store`, `storeCode`, `attemptId`, `httpStatus`, and a bounded, redacted backend code when available. Examples of setup failures are a missing/invalid key, unsupported Activity, unavailable store, unsupported Myket subscription, and a mismatched server route. Do not log receipt JSON, tokens, signatures, developer payloads, API keys, or payment URLs.
+Useful failure details include `store`, `storeCode`, `attemptId`, `httpStatus`, and a bounded, redacted backend code when available. Examples of setup failures are a missing/invalid key, unsupported Activity, unavailable store, and a mismatched server route. Do not log receipt JSON, tokens, signatures, developer payloads, API keys, or payment URLs.
 
 ## Consumables and restore
 
@@ -145,3 +145,15 @@ Test the final store-specific APK, matching signing/package identity, store acco
 - [Store route/query mapping](../sdk/src/main/kotlin/com/inappify/sdk/internal/billing/StoreMarket.kt), [adapter factory](../sdk/src/main/kotlin/com/inappify/sdk/internal/billing/AndroidStoreBillingAdapterFactory.kt), and [SDK manifest](../sdk/src/main/AndroidManifest.xml).
 - [Bazaar adapter](../sdk/src/main/kotlin/com/inappify/sdk/internal/billing/BazaarStoreBillingAdapter.kt), [Myket adapter](../sdk/src/main/kotlin/com/inappify/sdk/internal/billing/MyketStoreBillingAdapter.kt), [Myket receipt validation](../sdk/src/main/kotlin/com/inappify/sdk/internal/billing/MyketReceiptValidator.kt), and [Activity requirements](../sdk/src/main/kotlin/com/inappify/sdk/internal/billing/StoreUiHost.kt).
 - [Configure/purchase/reconciliation client](../sdk/src/main/kotlin/com/inappify/sdk/internal/v2/GoV2Client.kt), [product types](../sdk/src/main/kotlin/com/inappify/sdk/InappifyProductType.kt), [store statuses](../sdk/src/main/kotlin/com/inappify/sdk/InappifyStorePurchaseStatus.kt), and [consumable API](../sdk/src/main/kotlin/com/inappify/sdk/InappifyConsumableFulfillment.kt).
+
+## Myket timed subscriptions (Kotlin 0.2.2 / Flutter 0.2.3)
+
+Follow [Myket's Java documentation](https://myket.ir/kb/pages/java/): Myket does not offer native subscriptions. Register a **consumable** SKU in Myket for each timed plan; map the same SKU to **SUBSCRIPTION** in Inappify and set its package duration. Keep lifetime SKUs non-consumable in both catalogs. Ordinary consumables keep their existing host delivery/confirmation flow.
+
+The SDK buys the timed plan as `IN_APP`, preserves `SUBSCRIPTION` in its bound developer payload, and sends the original signed receipt to Inappify. The backend verifies it with Myket, grants/extends access once per purchase token, and returns `requiresConsumption: true` with the committed payment/event IDs. Only then does the SDK consume it. There is no host consumable callback for timed subscriptions. Each manual renewal is a new purchase/token; there is no automatic charge, `subs` inventory, or Bazaar-style subscription chain.
+
+Deploy the matching V2 commerce backend **before** distributing these SDKs: initial/replayed purchase and verification-status responses must include this authorization. Missing/false authorization retains the paid receipt and fails without consuming it. Consumption failures retain the encrypted journal and retry the same receipt; successful consumption is checkpointed before finalization. A Myket ITEM_NOT_OWNED response after a verified grant safely finishes an uncertain prior consume. It does not authorize a new entitlement. No journal schema or public method changes are required. Older SDKs still reject initiating Myket subscriptions; downgrading before pending Myket subscription work finishes is not supported.
+
+Recovery examines bound Myket `IN_APP` receipts, including subscriptions already present in CustomerInfo, to finish consumption after process death. Explicit restore can reconcile an unconsumed bound subscription receipt; consumed history is obtained from server CustomerInfo for the same identity, not Myket inventory. Receipts without a valid customer/package binding are not adopted. Bazaar subscription, Direct checkout and V1 service behavior are unchanged.
+
+Release acceptance on a real Myket device: purchase each of the three product types; confirm lifetime remains owned, consumables wait for host delivery, and timed plans grant once then become buyable again. Repeat renewal, cancellation, network loss during verification/consumption, process death and restore. Automated mocks do not establish real-store acceptance.

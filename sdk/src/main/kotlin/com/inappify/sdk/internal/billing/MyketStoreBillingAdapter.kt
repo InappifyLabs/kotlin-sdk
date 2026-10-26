@@ -75,6 +75,7 @@ internal class MyketStoreBillingAdapter(context: Context, private val rsaPublicK
             helper.consumeAsync(receipt) { _, result ->
                 complete(when (result.response) {
                     IabHelper.BILLING_RESPONSE_RESULT_OK -> StoreConsumeResult.Success
+                    IabHelper.BILLING_RESPONSE_RESULT_ITEM_NOT_OWNED -> StoreConsumeResult.RetryableFailure(error(StoreBillingErrorCode.ITEM_NOT_OWNED, true))
                     IabHelper.BILLING_RESPONSE_RESULT_DEVELOPER_ERROR -> StoreConsumeResult.PermanentFailure(error(StoreBillingErrorCode.CONSUME_FAILED))
                     else -> StoreConsumeResult.RetryableFailure(error(StoreBillingErrorCode.CONSUME_FAILED, true))
                 })
