@@ -37,6 +37,7 @@ internal class MyketStoreBillingAdapter(context: Context, private val rsaPublicK
                         StoreBillingErrorCode.PURCHASE_FAILED,
                         "Myket purchase callback failed.",
                         storeResponseCode = result.response,
+                        failureStage = "PURCHASE_CALLBACK",
                     )))
                     else -> {
                         val receipt = purchase?.let { validator.validate(it.originalJson, it.signature,
@@ -142,10 +143,10 @@ internal class MyketStoreBillingAdapter(context: Context, private val rsaPublicK
                                 if (!done.get()) {
                                     if (!result.isSuccess) finish(failure(error(StoreBillingErrorCode.CONNECTION_FAILED, true)))
                                     else try { start(client, ::finish) }
-                                    catch (_: Exception) { finish(failure(error(StoreBillingErrorCode.PURCHASE_FAILED))) }
+                                    catch (exception: Exception) { finish(failure(myketOperationException(exception, "OPERATION_START"))) }
                                 }
                             }
-                        } catch (_: Exception) { finish(failure(error(StoreBillingErrorCode.CONNECTION_FAILED, true))) }
+                        } catch (exception: Exception) { finish(failure(myketOperationException(exception, "SETUP"))) }
                     }) finish(failure(error(StoreBillingErrorCode.MAIN_THREAD_UNAVAILABLE)))
                 }
             } ?: failure(error(StoreBillingErrorCode.OPERATION_TIMEOUT, true))

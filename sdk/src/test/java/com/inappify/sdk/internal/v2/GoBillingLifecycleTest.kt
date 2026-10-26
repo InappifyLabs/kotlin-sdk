@@ -63,7 +63,9 @@ class GoBillingLifecycleTest(private val nativeMarket: InappifyMarket) {
             configure(sdk)
             sdk.purchase(Activity(), InappifyPurchaseRequest("product", "default",
                 idempotencyKey = "binding-attempt", productType = InappifyProductType.CONSUMABLE))
-            val payload = JsonParser.parseString(nativeRequests.single().developerPayload).asJsonObject
+            val payload = if (nativeMarket == InappifyMarket.MYKET)
+                MyketPurchasePayload.decode(nativeRequests.single().developerPayload, "product")
+                else JsonParser.parseString(nativeRequests.single().developerPayload).asJsonObject
             val customer = MessageDigest.getInstance("SHA-256").digest(fixture.subject.toByteArray(Charsets.UTF_8))
                 .joinToString("") { "%02x".format(it) }
             assertEquals(goPurchaseBinding(12, "com.example.mobile", customer, "product", "default", "package"),

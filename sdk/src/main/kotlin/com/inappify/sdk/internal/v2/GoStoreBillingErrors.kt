@@ -26,5 +26,11 @@ internal fun StoreBillingError.toGoPurchaseError(attemptId: String, store: Strin
         isRetryable = isRetryable && !uncertain,
         details = mapOf("operation" to "purchase", "attemptId" to attemptId, "store" to store,
             "storeCode" to code.name, "outcomeMayHaveCommitted" to uncertain) +
-            (storeResponseCode?.let { mapOf("storeResponseCode" to it) } ?: emptyMap()))
+            (storeResponseCode?.let { mapOf("storeResponseCode" to it) } ?: emptyMap()) +
+            (if (store == "myket") buildMap<String, Any?> {
+                if (failureStage in setOf("SETUP", "OPERATION_START", "PURCHASE_CALLBACK"))
+                    put("storeFailureStage", failureStage)
+                if (causeType in setOf("SECURITY", "ILLEGAL_STATE", "INVALID_ARGUMENT", "NULL_REFERENCE", "TYPE_MISMATCH", "OTHER"))
+                    put("storeExceptionCategory", causeType)
+            } else emptyMap()))
 }

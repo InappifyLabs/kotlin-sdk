@@ -247,6 +247,39 @@ class GoAutomaticStoreRecoveryTest {
         }
     }
 
+    @Test fun compactMyketReceiptRestoresOriginalAttemptAndConsumesOnlyAfterCommittedGrant() = runBlocking {
+        val fixture = Fixture(InappifyMarket.MYKET)
+        fixture.seedConfiguredSession()
+        val binding = goPurchaseBinding(12, "com.example.mobile", fixture.digest(fixture.signing.subject),
+            "product", "original", "package")
+        val original = fixture.receipt(type = InappifyProductType.SUBSCRIPTION, purchaseBinding = JsonPrimitive(binding))
+        val receipt = StorePurchase(original.orderIdentifier, original.purchaseToken,
+            MyketPurchasePayload.encode(jsonObject(original.developerPayload)), original.packageName,
+            original.productIdentifier, original.purchaseTimeMillis, original.originalJson, original.signature)
+        fixture.owned[StoreProductType.IN_APP] = StorePurchaseQueryResult.Success(listOf(receipt))
+        fixture.consumeResult = StoreConsumeResult.Success
+        fixture.commerceTransport.handler = { request ->
+            assertTrue(fixture.consumedTokens.isEmpty())
+            assertEquals("store/purchases", request.path)
+            assertEquals(receipt.developerPayload, jsonObject(request.jsonBody).getAsJsonObject("purchase").string("developerPayload"))
+            fixture.commerceTransport.response(jsonObject("""{"status":true,"data":{"purchase":{
+                "status":"COMPLETED","alreadyProcessed":true,"requiresConsumption":true,
+                "paymentId":11,"eventId":12,"verificationRequestId":13,"deliveryId":null,
+                "productType":1,"source":"myket","productIdentifier":"product"}}}"""))
+        }
+        assertTrue(fixture.automaticRecovery(InappifyConsumableDeliveryHandler {
+            error("A previously granted subscription must never be delivered again")
+        }) is InappifyResult.Success)
+        assertEquals(listOf(receipt.purchaseToken), fixture.consumedTokens)
+        assertTrue(fixture.storage.operations.isEmpty())
+        fixture.client(backgroundRecovery = false).use { sdk ->
+            assertTrue(sdk.configure(fixture.options) is InappifyResult.Success)
+            val attempt = (sdk.getPurchaseAttempt("attempt-1") as InappifyResult.Success).data!!
+            assertEquals(InappifyPurchaseAttemptStatus.SUCCEEDED, attempt.status)
+            assertEquals("package", attempt.purchase!!.packageIdentifier)
+        }
+    }
+
     @Test fun recoveryRejectsMalformedOrMismatchedNewBindingsForBothMarkets() = runBlocking {
         for (market in listOf(InappifyMarket.BAZAAR, InappifyMarket.MYKET)) {
             for (binding in listOf(JsonNull.INSTANCE, JsonPrimitive(123), JsonPrimitive("v1:wrong"))) {
@@ -899,7 +932,12 @@ class GoAutomaticStoreRecoveryTest {
         val release = CompletableDeferred<Unit>()
     }
 
-    private class RecoveryStore : SessionStateStore {
+    private class RecoveryStore : SessionStateStore, com.inappify.sdk.internal.storage.PurchaseAttemptStorage {
+        private var history = "{\"version\":1,\"attempts\":[]}"
+        override suspend fun readPurchaseAttemptHistory(): String = synchronized(this) { history }
+        override suspend fun mutatePurchaseAttemptHistory(mutation: (String) -> String): Boolean = synchronized(this) {
+            history = mutation(history); true
+        }
         @Volatile var session: PersistedSession? = null
         val operations = CopyOnWriteArrayList<PendingStoreOperation>()
         val writtenOperations = CopyOnWriteArrayList<PendingStoreOperation>()

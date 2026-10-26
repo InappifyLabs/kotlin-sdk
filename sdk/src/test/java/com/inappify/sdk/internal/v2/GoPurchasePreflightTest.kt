@@ -56,6 +56,7 @@ class GoPurchasePreflightTest {
         val queryCalls = AtomicInteger()
         var lastPurchased: StorePurchase? = null
         var ownedPurchases = emptyList<StorePurchase>()
+        var purchaseError: StoreBillingError? = null
         @Volatile var customer = signing.subject
         @Volatile var queryGate: Gate? = null
         @Volatile var queueGate: Gate? = null
@@ -109,6 +110,7 @@ class GoPurchasePreflightTest {
             billingFactory = StoreBillingAdapterFactory { _, _ -> object : StoreBillingAdapter {
                 override suspend fun purchase(uiHost: StoreUiHost, request: StorePurchaseRequest): StoreBillingResult {
                     val count = uiCalls.incrementAndGet()
+                    purchaseError?.let { return StoreBillingResult.Failure(it) }
                     val receipt = StorePurchase("order-$count", "token-$count", request.developerPayload!!,
                         "com.example.mobile", request.productIdentifier, signing.now, "original-json", "signature")
                     lastPurchased = receipt
@@ -151,6 +153,61 @@ class GoPurchasePreflightTest {
         }
         private fun digest(value: String) = MessageDigest.getInstance("SHA-256").digest(value.toByteArray())
             .joinToString("") { "%02x".format(it) }
+    }
+
+    @Test fun myketFailureDiagnosticsSurviveRestartWhileAttemptRemainsPending() = runBlocking {
+        val f = Fixture(InappifyMarket.MYKET)
+        f.purchaseError = StoreBillingError(StoreBillingErrorCode.PURCHASE_FAILED, "private receipt", causeType = "ILLEGAL_STATE",
+            storeResponseCode = -1002, failureStage = "PURCHASE_CALLBACK")
+        f.client().use { sdk ->
+            f.configure(sdk)
+            val result = sdk.purchase(Activity(), f.request(attempt = "uncertain")) as InappifyResult.Failure
+            assertEquals(-1002, result.error.details["storeResponseCode"])
+            assertTrue(f.commerce.requests.isEmpty())
+        }
+        f.client().use { sdk ->
+            f.configure(sdk)
+            val result = sdk.getPurchaseAttempt("uncertain") as InappifyResult.Success
+            assertEquals(InappifyPurchaseAttemptStatus.PENDING, result.data!!.status)
+            assertEquals(-1002, (result.data!!.error!!.details["storeResponseCode"] as Number).toInt())
+            assertEquals("PURCHASE_CALLBACK", result.data!!.error!!.details["storeFailureStage"])
+            assertEquals("ILLEGAL_STATE", result.data!!.error!!.details["storeExceptionCategory"])
+            assertEquals(1, f.uiCalls.get())
+            assertFalse(f.storage.history.contains("private receipt"))
+        }
+    }
+
+    @Test fun oversizedMyketAttemptNeverOpensBillingOrCreatesPendingHistory() = runBlocking {
+        val f = Fixture(InappifyMarket.MYKET)
+        f.client().use { sdk ->
+            f.configure(sdk)
+            val result = sdk.purchase(Activity(), f.request(attempt = "a".repeat(128))) as InappifyResult.Failure
+            assertEquals("MYKET_PAYLOAD_TOO_LARGE", result.error.details["serverCode"])
+            assertEquals(false, result.error.details["outcomeMayHaveCommitted"])
+            assertEquals(0, f.uiCalls.get())
+            assertEquals(0, f.commerce.requests.size)
+            assertTrue((sdk.getPurchaseAttempts() as InappifyResult.Success).data.isEmpty())
+        }
+    }
+
+    @Test fun bazaarRetainsVerbosePayloadWithoutMyketSizeLimit() = runBlocking {
+        val f = Fixture(InappifyMarket.BAZAAR)
+        f.client().use { sdk ->
+            f.configure(sdk)
+            val attempt = "a".repeat(128)
+            val result = sdk.purchase(Activity(), f.request(attempt = attempt, offering = "original")) as InappifyResult.Success
+            assertEquals(InappifyStorePurchaseStatus.COMPLETED, result.data.storePurchaseStatus)
+            val raw = f.lastPurchased!!.developerPayload
+            assertTrue(raw.toByteArray(Charsets.UTF_8).size > MyketPurchasePayload.MAX_BYTES)
+            val payload = jsonObject(raw)
+            assertFalse(payload.has("v"))
+            assertEquals(attempt, payload.string("attemptId"))
+            assertEquals("product", payload.string("productIdentifier"))
+            assertEquals("original", payload.string("offeringIdentifier"))
+            assertEquals("original-package", payload.string("nativePackageIdentifier"))
+            assertEquals(1, f.uiCalls.get())
+            assertEquals(listOf("store/purchases"), f.commerce.requests.map { it.path })
+        }
     }
 
     @Test fun freshPurchaseKeepsItsRequestsAndDoesNotStartARecoveryPass() = runBlocking {

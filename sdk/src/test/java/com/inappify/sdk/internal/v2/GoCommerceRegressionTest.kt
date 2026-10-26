@@ -104,7 +104,8 @@ class GoCommerceRegressionTest(private val nativeMarket: InappifyMarket) {
     @Test fun packagePurchaseUsesExactParentAndTheExistingStoreReceiptContract() = runBlocking {
         freshPurchase = { request ->
             assertEquals(StoreProductType.IN_APP, request.productType)
-            val payload = jsonObject(request.developerPayload!!)
+            val payload = if (nativeMarket == InappifyMarket.MYKET) MyketPurchasePayload.decode(request.developerPayload, "product")
+                else jsonObject(request.developerPayload!!)
             assertEquals("original", payload.string("offeringIdentifier"))
             assertEquals("package", payload.string("nativePackageIdentifier"))
             assertEquals("NON_CONSUMABLE", payload.string("productType"))
@@ -135,7 +136,9 @@ class GoCommerceRegressionTest(private val nativeMarket: InappifyMarket) {
     @Test fun packageSubscriptionUsesStoreSpecificBillingAndMyketConsumesAfterServerGrant() = runBlocking {
         freshPurchase = { request ->
             assertEquals(if (nativeMarket == InappifyMarket.MYKET) StoreProductType.IN_APP else StoreProductType.SUBSCRIPTION, request.productType)
-            assertEquals("SUBSCRIPTION", jsonObject(request.developerPayload!!).string("productType"))
+            val payload = if (nativeMarket == InappifyMarket.MYKET) MyketPurchasePayload.decode(request.developerPayload, "product")
+                else jsonObject(request.developerPayload!!)
+            assertEquals("SUBSCRIPTION", payload.string("productType"))
             assertEquals(0, consumeCalls)
             successfulReceipt(request)
         }

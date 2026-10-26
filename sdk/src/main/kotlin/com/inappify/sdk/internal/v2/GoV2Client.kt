@@ -826,7 +826,13 @@ internal class GoV2Client(
     }
     private fun safeAttemptError(error: InappifyError): InappifyError = InappifyError(error.code,
         "Purchase attempt ${error.code.name}.", error.isRetryable, error.details.filter { (key, value) ->
-            key in setOf("category", "serverCode", "httpStatus", "outcomeMayHaveCommitted", "phase", "attemptId", "store", "storeCode") &&
+            (key in setOf("category", "serverCode", "httpStatus", "outcomeMayHaveCommitted", "phase", "attemptId", "store", "storeCode") ||
+                (error.details["store"] == "myket" && when (key) {
+                    "storeResponseCode" -> value is Int
+                    "storeFailureStage" -> value in setOf("SETUP", "OPERATION_START", "PURCHASE_CALLBACK")
+                    "storeExceptionCategory" -> value in setOf("SECURITY", "ILLEGAL_STATE", "INVALID_ARGUMENT", "NULL_REFERENCE", "TYPE_MISMATCH", "OTHER")
+                    else -> false
+                })) &&
                 (value == null || value is String || value is Boolean || value is Number)
         })
     private suspend fun recordStoreAttempt(outcome: StoreV2Outcome, emit: Boolean = true): InappifyPurchaseAttempt {
@@ -1001,7 +1007,8 @@ internal class GoV2Client(
     }
 
     private fun originalPackage(operation: PendingStoreOperation): String? = runCatching {
-        JsonParser.parseString(operation.evidence.developerPayload).asJsonObject
+        (if (operation.store == "myket") MyketPurchasePayload.decode(operation.evidence.developerPayload, operation.productIdentifier)
+            else JsonParser.parseString(operation.evidence.developerPayload).asJsonObject)
             .get("nativePackageIdentifier")?.takeUnless { it.isJsonNull }?.asString?.takeIf(String::isNotBlank)
     }.getOrNull()
     private suspend fun purchaseDirectV2(request: InappifyPurchaseRequest, packageIdentifier: String?): InappifyPurchase {
@@ -1140,10 +1147,7 @@ internal class GoV2Client(
         val nativePackageIdentifier = packageIdentifier?.takeIf(String::isNotBlank)
             ?: fail("VALIDATION", "PACKAGE_IDENTIFIER_REQUIRED")
         val binding = currentAttemptBinding()
-        recordAttempt(binding, InappifyPurchaseAttempt(attemptId, request.productIdentifier, request.offeringIdentifier,
-            context.market, InappifyPurchaseAttemptStatus.PENDING, null, null, now()), outcomeMayHaveCommitted = false)
-        val adapter = createBillingAdapter(context.marketKey, context.market)
-        val developerPayload = JsonObject().apply {
+        val payload = JsonObject().apply {
             addProperty("offeringIdentifier", request.offeringIdentifier)
             addProperty("productIdentifier", request.productIdentifier)
             addProperty("nativePackageIdentifier", packageIdentifier)
@@ -1153,7 +1157,18 @@ internal class GoV2Client(
             addProperty("purchaseBinding", goPurchaseBinding(appId, context.appIdentifier,
                 context.customerIdentifierFingerprint, request.productIdentifier,
                 request.offeringIdentifier, nativePackageIdentifier))
-        }.toString()
+        }
+        val developerPayload = if (context.market == InappifyMarket.MYKET) {
+            try { MyketPurchasePayload.encode(payload) }
+            catch (_: IllegalArgumentException) {
+                throw V2Failure(InappifyError(InappifyErrorCode.INVALID_CONFIGURATION,
+                    "The Myket purchase context is too large. Use shorter offering, package or attempt identifiers.",
+                    details = mapOf("serverCode" to "MYKET_PAYLOAD_TOO_LARGE", "outcomeMayHaveCommitted" to false)))
+            }
+        } else payload.toString()
+        recordAttempt(binding, InappifyPurchaseAttempt(attemptId, request.productIdentifier, request.offeringIdentifier,
+            context.market, InappifyPurchaseAttemptStatus.PENDING, null, null, now()), outcomeMayHaveCommitted = false)
+        val adapter = createBillingAdapter(context.marketKey, context.market)
         val receipt = try {
             when (val billed = adapter.purchase(StoreUiHost.from(host), StorePurchaseRequest(
                 request.productIdentifier,
@@ -1204,7 +1219,7 @@ internal class GoV2Client(
         // The server may correct Myket's journal type, but a retry still belongs to the
         // original signed request. Never let callers change its declared product type.
         val original = if (saved.store == "myket") runCatching {
-            val payload = JsonParser.parseString(saved.evidence.developerPayload).asJsonObject
+            val payload = MyketPurchasePayload.decode(saved.evidence.developerPayload, saved.productIdentifier)
             payload.get("productType")?.takeUnless { it.isJsonNull }?.asString
                 ?.let { InappifyProductType.valueOf(it) }
         }.getOrNull() else null
@@ -1357,7 +1372,10 @@ internal class GoV2Client(
                                         "Subscription recovery requires the original signed store receipt.")
                                     continue
                                 }
-                                val payload = runCatching { JsonParser.parseString(receipt.developerPayload).asJsonObject }
+                                val payload = runCatching {
+                                    if (context.market == InappifyMarket.MYKET) MyketPurchasePayload.decode(receipt.developerPayload, receipt.productIdentifier)
+                                    else JsonParser.parseString(receipt.developerPayload).asJsonObject
+                                }
                                     .getOrNull()
                                 val expectedBinding = digest("${context.apiKeyFingerprint}:${context.customerIdentifierFingerprint}")
                                 if (!unboundSubscription && (payload == null || runCatching { payload.get("recoveryBinding")?.asString }

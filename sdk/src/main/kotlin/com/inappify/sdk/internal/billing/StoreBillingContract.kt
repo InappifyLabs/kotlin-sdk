@@ -219,6 +219,7 @@ internal class StoreBillingError(
     val isRetryable: Boolean = false,
     val causeType: String? = null,
     val storeResponseCode: Int? = null,
+    val failureStage: String? = null,
 ) {
 
     /** Omits the underlying exception type to keep logs stable and intentionally minimal. */

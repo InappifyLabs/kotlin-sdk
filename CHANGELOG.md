@@ -1,3 +1,8 @@
+## 0.2.4
+
+- Compact only Myket purchase payloads while preserving customer/recovery bindings and the deployed server's `purchaseBinding` contract. Reject oversized contexts before opening billing or recording a new pending native attempt; continue recovering older signed payloads.
+- Preserve safe Myket callback codes and fixed exception/stage categories in durable attempt history. Do not change Bazaar, Direct, entitlement grants, consumption authorization or existing pending attempts.
+
 ## 0.2.3
 
 - Use the committed server product type for Myket recovery, including receipts created by older SDKs with a different local type. Require matching purchase scope and committed payment/delivery evidence before changing recovery behavior.

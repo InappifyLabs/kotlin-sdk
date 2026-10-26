@@ -2,13 +2,13 @@
 
 Repository: <https://github.com/InappifyLabs/kotlin-sdk>.
 
-The runtime version in `gradle.properties` is `0.2.3`. Beta versions use
+The runtime version in `gradle.properties` is `0.2.4`. Beta versions use
 `major.minor.patch-beta.N`; stable versions use `major.minor.patch`. Git tags
-prefix this value with `v`, so the prepared tag is `v0.2.3`. JitPack
+prefix this value with `v`, so the prepared tag is `v0.2.4`. JitPack
 consumers use the tag verbatim:
 
 ```kotlin
-implementation("com.github.InappifyLabs:kotlin-sdk:v0.2.3")
+implementation("com.github.InappifyLabs:kotlin-sdk:v0.2.4")
 ```
 
 `BuildConfig.SDK_VERSION`, Configure's `sdkVersion`, SDK user-agent and snapshots
@@ -18,9 +18,9 @@ change receipt bindings, application identity or encrypted storage scope.
 
 ## Prepare and validate
 
-For v0.2.3, deploy the matching commerce backend before clients: Myket recovery
+For v0.2.4, deploy the matching commerce backend before clients: Myket recovery
 needs committed purchase type, scope and delivery evidence. Publish and verify
-this native tag before Flutter 0.2.4. Local version bumps do not publish artifacts.
+this native tag before Flutter 0.2.5. Local version bumps do not publish artifacts.
 
 1. Update `VERSION_NAME` and the changelog, then review the public tree.
 2. Use JDK 17 and the Gradle wrapper to run:
