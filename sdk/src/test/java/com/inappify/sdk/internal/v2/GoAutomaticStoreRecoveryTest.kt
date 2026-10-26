@@ -280,6 +280,64 @@ class GoAutomaticStoreRecoveryTest {
         }
     }
 
+    @Test fun compactMyketRecoveryRetriesPackageRejectionWithoutClearingANewerPendingAttempt() = runBlocking {
+        val fixture = Fixture(InappifyMarket.MYKET)
+        fixture.seedConfiguredSession()
+        val binding = goPurchaseBinding(12, "com.example.mobile", fixture.digest(fixture.signing.subject),
+            "product", "original", "package")
+        val original = fixture.receipt(type = InappifyProductType.SUBSCRIPTION, purchaseBinding = JsonPrimitive(binding))
+        val receipt = StorePurchase(original.orderIdentifier, original.purchaseToken,
+            MyketPurchasePayload.encode(jsonObject(original.developerPayload)), original.packageName,
+            original.productIdentifier, original.purchaseTimeMillis, original.originalJson, original.signature)
+        val pending = fixture.pending(receipt, PendingStoreProductType.SUBSCRIPTION)
+        val historyBinding = fixture.digest(listOf(pending.apiKeyFingerprint, pending.customerIdentifierFingerprint,
+            pending.appIdentifier, pending.appId.toString(), pending.store).joinToString("") { "${it.length}:$it" })
+        val history = PurchaseAttemptHistory(fixture.storage)
+        history.put(historyBinding, InappifyPurchaseAttempt("attempt-1", "product", "original", InappifyMarket.MYKET,
+            InappifyPurchaseAttemptStatus.FAILED, null, InappifyError(InappifyErrorCode.PURCHASE_CANCELLED, "Cancelled"), fixture.signing.now))
+        val newerAttempt = InappifyPurchaseAttempt("newer-attempt", "product", "original", InappifyMarket.MYKET,
+            InappifyPurchaseAttemptStatus.PENDING, null, InappifyError(InappifyErrorCode.MALFORMED_RESPONSE,
+                "Uncertain callback", details = mapOf("outcomeMayHaveCommitted" to true)), fixture.signing.now)
+        history.put(historyBinding, newerAttempt)
+        fixture.owned[StoreProductType.IN_APP] = StorePurchaseQueryResult.Success(listOf(receipt))
+        fixture.commerceTransport.handler = {
+            TransportResult.Response(HttpResponse(422,
+                """{"status":false,"message":"The purchase package identifier is missing or invalid."}""", null))
+        }
+
+        assertTrue(fixture.automaticRecovery() is InappifyResult.Failure)
+        assertEquals("attempt-1", fixture.storage.operations.single().id)
+        assertEquals(PendingStoreOperationPhase.REGISTERING, fixture.storage.operations.single().phase)
+        assertTrue(fixture.storage.tombstones.isEmpty())
+        assertTrue(fixture.consumedTokens.isEmpty())
+        assertEquals(InappifyPurchaseAttemptStatus.PENDING, history.list(historyBinding).single { it.attemptId == "newer-attempt" }.status)
+
+        // The same installed SDK resumes its original encrypted receipt after a server fix.
+        fixture.consumeResult = StoreConsumeResult.Success
+        fixture.commerceTransport.requests.clear()
+        fixture.commerceTransport.handler = { request ->
+            assertEquals("store/purchases", request.path)
+            assertEquals(receipt.developerPayload, jsonObject(request.jsonBody).getAsJsonObject("purchase").string("developerPayload"))
+            assertTrue(fixture.consumedTokens.isEmpty())
+            fixture.commerceTransport.response(jsonObject("""{"status":true,"data":{"purchase":{
+                "status":"COMPLETED","alreadyProcessed":true,"requiresConsumption":true,
+                "paymentId":11,"eventId":12,"verificationRequestId":13,"deliveryId":null,
+                "productType":1,"source":"myket","productIdentifier":"product"}}}"""))
+        }
+        assertTrue(fixture.automaticRecovery(InappifyConsumableDeliveryHandler {
+            error("Subscription recovery must not grant host inventory")
+        }) is InappifyResult.Success)
+        assertEquals(1, fixture.commerceTransport.requests.size)
+        assertEquals(listOf(receipt.purchaseToken), fixture.consumedTokens)
+        assertTrue(fixture.storage.operations.isEmpty())
+        val attempts = history.list(historyBinding)
+        assertEquals(InappifyPurchaseAttemptStatus.SUCCEEDED, attempts.single { it.attemptId == "attempt-1" }.status)
+        val preserved = attempts.single { it.attemptId == "newer-attempt" }
+        assertEquals(newerAttempt.status, preserved.status)
+        assertEquals(newerAttempt.error!!.details, preserved.error!!.details)
+        assertEquals(newerAttempt.updatedAtEpochMillis, preserved.updatedAtEpochMillis)
+    }
+
     @Test fun recoveryRejectsMalformedOrMismatchedNewBindingsForBothMarkets() = runBlocking {
         for (market in listOf(InappifyMarket.BAZAAR, InappifyMarket.MYKET)) {
             for (binding in listOf(JsonNull.INSTANCE, JsonPrimitive(123), JsonPrimitive("v1:wrong"))) {

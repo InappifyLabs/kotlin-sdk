@@ -57,6 +57,7 @@ class GoPurchasePreflightTest {
         var lastPurchased: StorePurchase? = null
         var ownedPurchases = emptyList<StorePurchase>()
         var purchaseError: StoreBillingError? = null
+        var purchaseCancelled = false
         @Volatile var customer = signing.subject
         @Volatile var queryGate: Gate? = null
         @Volatile var queueGate: Gate? = null
@@ -110,6 +111,7 @@ class GoPurchasePreflightTest {
             billingFactory = StoreBillingAdapterFactory { _, _ -> object : StoreBillingAdapter {
                 override suspend fun purchase(uiHost: StoreUiHost, request: StorePurchaseRequest): StoreBillingResult {
                     val count = uiCalls.incrementAndGet()
+                    if (purchaseCancelled) return StoreBillingResult.Cancelled
                     purchaseError?.let { return StoreBillingResult.Failure(it) }
                     val receipt = StorePurchase("order-$count", "token-$count", request.developerPayload!!,
                         "com.example.mobile", request.productIdentifier, signing.now, "original-json", "signature")
@@ -153,6 +155,34 @@ class GoPurchasePreflightTest {
         }
         private fun digest(value: String) = MessageDigest.getInstance("SHA-256").digest(value.toByteArray())
             .joinToString("") { "%02x".format(it) }
+    }
+
+    @Test fun confirmedSubscriptionCancellationSurvivesRestartAndAllowsNewAttempt() = runBlocking {
+        for (market in listOf(InappifyMarket.MYKET, InappifyMarket.BAZAAR)) {
+            val f = Fixture(market).apply { purchaseCancelled = true }
+            f.client().use { sdk ->
+                f.configure(sdk)
+                val result = sdk.purchase(Activity(), f.request(attempt = "cancelled-first",
+                    type = InappifyProductType.SUBSCRIPTION)) as InappifyResult.Failure
+                assertEquals(InappifyErrorCode.PURCHASE_CANCELLED, result.error.code)
+                assertNotEquals(true, result.error.details["outcomeMayHaveCommitted"])
+                assertTrue(f.storage.operations.isEmpty())
+                assertTrue(f.commerce.requests.isEmpty())
+            }
+            f.client().use { sdk ->
+                f.configure(sdk)
+                val previous = (sdk.getPurchaseAttempt("cancelled-first") as InappifyResult.Success).data!!
+                assertEquals(InappifyPurchaseAttemptStatus.FAILED, previous.status)
+                assertEquals(InappifyErrorCode.PURCHASE_CANCELLED, previous.error!!.code)
+                assertNotEquals(true, previous.error!!.details["outcomeMayHaveCommitted"])
+                val next = sdk.purchase(Activity(), f.request(attempt = "cancelled-next",
+                    type = InappifyProductType.SUBSCRIPTION)) as InappifyResult.Failure
+                assertEquals(InappifyErrorCode.PURCHASE_CANCELLED, next.error.code)
+                assertEquals(2, f.uiCalls.get())
+                assertTrue(f.commerce.requests.isEmpty())
+                assertTrue((sdk.getPurchaseAttempts() as InappifyResult.Success).data.all { it.isFinal })
+            }
+        }
     }
 
     @Test fun myketFailureDiagnosticsSurviveRestartWhileAttemptRemainsPending() = runBlocking {
