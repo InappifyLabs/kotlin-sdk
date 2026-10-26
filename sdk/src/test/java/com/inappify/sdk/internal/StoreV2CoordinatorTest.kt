@@ -47,6 +47,130 @@ import com.inappify.sdk.internal.billing.storeId
 @RunWith(Parameterized::class)
 class StoreV2CoordinatorTest(private val market: InappifyMarket) {
 
+    @Test fun myketServerTypeOverridesEveryHistoricalTypeAfterCommittedGrant() = runBlocking {
+        if (market != InappifyMarket.MYKET) return@runBlocking
+        for (oldType in PendingStoreProductType.entries) {
+            for (serverType in listOf(1, 3)) {
+                val fixture = fixture()
+                fixture.service.submitResults += authoritativeResponse(serverType, StorePurchaseStatus.COMPLETED)
+                fixture.billing.consumeResults += StoreConsumeResult.Success
+                val result = fixture.coordinator.submit(operation(productType = oldType), context())
+                assertTrue("$oldType -> $serverType", result is StoreV2Outcome.Terminal)
+                assertEquals(if (serverType == 1) 1 else 0, fixture.billing.consumeCalls)
+                assertEquals(0, fixture.stateStore.operationCount)
+                assertTrue(fixture.events.none { it == EVENT_DELIVER || it == EVENT_REPORT })
+            }
+        }
+    }
+
+    @Test fun myketServerConsumableWaitsForDeliveryRegardlessOfOldType() = runBlocking {
+        if (market != InappifyMarket.MYKET) return@runBlocking
+        for (oldType in PendingStoreProductType.entries) {
+            val fixture = fixture()
+            fixture.service.submitResults += authoritativeResponse(2, StorePurchaseStatus.DELIVERY_REQUIRED, false)
+            val result = fixture.coordinator.submit(operation(productType = oldType), context())
+            assertTrue(result is StoreV2Outcome.PendingDelivery)
+            assertEquals(PendingStoreProductType.CONSUMABLE, fixture.stateStore.latestOperation().productType)
+            assertEquals(0, fixture.billing.consumeCalls)
+            fixture.service.deliveryResults += authoritativeResponse(2, StorePurchaseStatus.CONSUME_REQUIRED, true)
+            fixture.billing.consumeResults += StoreConsumeResult.Success
+            fixture.service.reportResults += authoritativeResponse(2, StorePurchaseStatus.COMPLETED, true)
+            assertTrue(fixture.coordinator.confirmDelivery(fixture.stateStore.latestOperation(), context()) is StoreV2Outcome.Terminal)
+            assertEquals(1, fixture.billing.consumeCalls)
+        }
+    }
+
+    @Test fun myketServerDeliveredOrConsumedReceiptNeverRequestsHostGrantAgain() = runBlocking {
+        if (market != InappifyMarket.MYKET) return@runBlocking
+        for (status in listOf(StorePurchaseStatus.CONSUME_REQUIRED, StorePurchaseStatus.COMPLETED)) {
+            val fixture = fixture()
+            fixture.service.submitResults += authoritativeResponse(2, status, true)
+            fixture.billing.consumeResults += StoreConsumeResult.Success
+            fixture.service.reportResults += authoritativeResponse(2, StorePurchaseStatus.COMPLETED, true)
+            assertTrue(fixture.coordinator.submit(operation(productType = PendingStoreProductType.NON_CONSUMABLE), context()) is StoreV2Outcome.Terminal)
+            assertEquals(if (status == StorePurchaseStatus.CONSUME_REQUIRED) 1 else 0, fixture.billing.consumeCalls)
+            assertFalse(fixture.events.contains(EVENT_DELIVER))
+        }
+    }
+
+    @Test fun serverTypeDoesNotOverrideBazaarOrExistingDeliveryCheckpoints() = runBlocking {
+        val fixture = fixture()
+        fixture.service.submitResults += authoritativeResponse(1, StorePurchaseStatus.COMPLETED)
+        val pending = operation(productType = PendingStoreProductType.CONSUMABLE,
+            deliveryId = if (market == InappifyMarket.MYKET) DELIVERY_ID else null)
+        assertTrue(fixture.coordinator.submit(pending, context()) is StoreV2Outcome.Rejected)
+        assertEquals(0, fixture.billing.consumeCalls)
+        assertEquals(1, fixture.stateStore.operationCount)
+    }
+
+    private fun authoritativeResponse(type: Int, status: StorePurchaseStatus, delivered: Boolean? = null): StoreServiceResult =
+        StoreServiceResult.Response(200, StoreBackendResponse(true, StorePurchaseState(
+            status, 11L, 12L, if (type == 2) DELIVERY_ID else null, null, null, null, null, true,
+            source = "myket", productIdentifier = "test-product", alreadyDelivered = delivered,
+            requiresConsumption = type == 1, productType = type,
+        ), null, null), null)
+
+    @Test fun legacyMyketSubscriptionConsumesOnlyAfterServerConfirmedGrant() = runBlocking {
+        for (status in listOf(StorePurchaseStatus.COMPLETED, StorePurchaseStatus.RESTORED, StorePurchaseStatus.ALREADY_PROCESSED)) {
+            val fixture = fixture()
+            fixture.service.submitResults += response(status, requiresConsumption = true)
+            fixture.billing.consumeResults += StoreConsumeResult.Success
+            val outcome = fixture.coordinator.submit(operation(productType = PendingStoreProductType.LEGACY_IN_APP), context())
+            if (market == InappifyMarket.MYKET) {
+                assertTrue(outcome is StoreV2Outcome.Terminal)
+                assertEquals(listOf(EVENT_SUBMIT, EVENT_CONSUME), fixture.events)
+                assertEquals(0, fixture.stateStore.operationCount)
+            } else {
+                assertTrue(outcome is StoreV2Outcome.Rejected)
+                assertEquals(0, fixture.billing.consumeCalls)
+                assertEquals(1, fixture.stateStore.operationCount)
+            }
+        }
+    }
+
+    @Test fun legacyMyketConsumeRetryRetainsReceiptAndDoesNotRepeatSuccessfulConsume() = runBlocking {
+        if (market != InappifyMarket.MYKET) return@runBlocking
+        val fixture = fixture()
+        fixture.service.submitResults += response(StorePurchaseStatus.COMPLETED, requiresConsumption = true)
+        fixture.billing.consumeResults += StoreConsumeResult.RetryableFailure(StoreBillingError(
+            StoreBillingErrorCode.CONNECTION_FAILED, "offline", true))
+        assertTrue(fixture.coordinator.submit(operation(productType = PendingStoreProductType.LEGACY_IN_APP), context()) is StoreV2Outcome.Deferred)
+        assertEquals(1, fixture.stateStore.operationCount)
+        fixture.clock.now += 120_000
+        fixture.stateStore.removeSucceeds = false
+        fixture.service.submitResults += response(StorePurchaseStatus.ALREADY_PROCESSED, requiresConsumption = true)
+        fixture.billing.consumeResults += StoreConsumeResult.Success
+        assertTrue(fixture.coordinator.resume(fixture.stateStore.latestOperation(), context()) is StoreV2Outcome.Failure)
+        assertEquals(PendingStoreConsumeResult.SUCCEEDED, fixture.stateStore.latestConsumeResult)
+        fixture.stateStore.removeSucceeds = true
+        fixture.service.submitResults += response(StorePurchaseStatus.ALREADY_PROCESSED, requiresConsumption = true)
+        assertTrue(fixture.coordinator.resume(fixture.stateStore.latestOperation(), context()) is StoreV2Outcome.Terminal)
+        assertEquals(2, fixture.billing.consumeCalls)
+        assertEquals(0, fixture.stateStore.operationCount)
+        assertTrue(fixture.events.none { it == EVENT_DELIVER || it == EVENT_REPORT })
+    }
+
+    @Test fun legacyConsumptionAuthorizationRejectsMissingGrantAndConflictingScope() = runBlocking {
+        if (market != InappifyMarket.MYKET) return@runBlocking
+        fun state(paymentId: Long? = 11L, eventId: Long? = 12L, source: String? = "myket",
+            product: String? = "test-product", deliveryId: Long? = null,
+            status: StorePurchaseStatus = StorePurchaseStatus.COMPLETED) = StorePurchaseState(
+            status, paymentId, eventId, deliveryId, null, null, null, null, true,
+            source = source, productIdentifier = product, requiresConsumption = true)
+        val invalid = listOf(
+            state(paymentId = null), state(eventId = null),
+            state(source = "bazar"), state(product = "other-product"),
+            state(deliveryId = 99L), state(status = StorePurchaseStatus.PROCESSING),
+        )
+        for (state in invalid) {
+            val fixture = fixture()
+            fixture.service.submitResults += StoreServiceResult.Response(200, StoreBackendResponse(true, state, null, null), null, null)
+            assertTrue(fixture.coordinator.submit(operation(productType = PendingStoreProductType.LEGACY_IN_APP), context()) is StoreV2Outcome.Rejected)
+            assertEquals(0, fixture.billing.consumeCalls)
+            assertEquals(1, fixture.stateStore.operationCount)
+        }
+    }
+
     @Test fun subscriptionConsumesOnlyForMyketAfterAuthoritativeGrant() = runBlocking {
         for (status in listOf(StorePurchaseStatus.COMPLETED, StorePurchaseStatus.RESTORED, StorePurchaseStatus.ALREADY_PROCESSED)) {
             val fixture = fixture()

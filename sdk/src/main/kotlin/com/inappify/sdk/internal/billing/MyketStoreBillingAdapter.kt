@@ -33,7 +33,11 @@ internal class MyketStoreBillingAdapter(context: Context, private val rsaPublicK
                 when {
                     result.response in setOf(IabHelper.IABHELPER_USER_CANCELLED, IabHelper.BILLING_RESPONSE_RESULT_USER_CANCELED) ->
                         complete(StoreBillingResult.Cancelled)
-                    !result.isSuccess -> complete(StoreBillingResult.Failure(error(StoreBillingErrorCode.PURCHASE_FAILED)))
+                    !result.isSuccess -> complete(StoreBillingResult.Failure(StoreBillingError(
+                        StoreBillingErrorCode.PURCHASE_FAILED,
+                        "Myket purchase callback failed.",
+                        storeResponseCode = result.response,
+                    )))
                     else -> {
                         val receipt = purchase?.let { validator.validate(it.originalJson, it.signature,
                             request.productIdentifier, request.developerPayload.orEmpty()) }

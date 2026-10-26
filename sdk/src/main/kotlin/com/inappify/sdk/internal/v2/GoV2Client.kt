@@ -960,7 +960,7 @@ internal class GoV2Client(
         exact?.nativeOperation?.let { operation ->
             if (operation.operation != PendingStoreOperationType.PURCHASE ||
                 operation.productIdentifier != request.productIdentifier || operation.offeringIdentifier != request.offeringIdentifier ||
-                !compatibleRetryType(request.productType, operation.productType)) fail("VALIDATION", "PURCHASE_ATTEMPT_CONFLICT")
+                !compatibleRetryType(request.productType, operation)) fail("VALIDATION", "PURCHASE_ATTEMPT_CONFLICT")
         }
         val previous = exact ?: recovered.firstOrNull { it.productIdentifier == request.productIdentifier } ?: return null
         return when (val result = previous.result) {
@@ -1127,7 +1127,7 @@ internal class GoV2Client(
                 existing.customerIdentifierFingerprint != context.customerIdentifierFingerprint ||
                 existing.appIdentifier != context.appIdentifier || existing.store != context.store ||
                 existing.operation != PendingStoreOperationType.PURCHASE ||
-                !compatibleRetryType(request.productType, existing.productType) ||
+                !compatibleRetryType(request.productType, existing) ||
                 existing.productIdentifier != request.productIdentifier ||
                 existing.offeringIdentifier != request.offeringIdentifier)
                 fail("VALIDATION", "PURCHASE_ATTEMPT_CONFLICT")
@@ -1200,9 +1200,19 @@ internal class GoV2Client(
             InappifyProductType.SUBSCRIPTION -> PendingStoreProductType.SUBSCRIPTION
             null -> PendingStoreProductType.LEGACY_IN_APP
         }
-    private fun compatibleRetryType(requested: InappifyProductType?, saved: PendingStoreProductType): Boolean =
-        if (requested == null) saved in setOf(PendingStoreProductType.LEGACY_IN_APP, PendingStoreProductType.CONSUMABLE)
-        else saved == pendingProductType(requested)
+    private fun compatibleRetryType(requested: InappifyProductType?, saved: PendingStoreOperation): Boolean {
+        // The server may correct Myket's journal type, but a retry still belongs to the
+        // original signed request. Never let callers change its declared product type.
+        val original = if (saved.store == "myket") runCatching {
+            val payload = JsonParser.parseString(saved.evidence.developerPayload).asJsonObject
+            payload.get("productType")?.takeUnless { it.isJsonNull }?.asString
+                ?.let { InappifyProductType.valueOf(it) }
+        }.getOrNull() else null
+        val expected = original?.let(::pendingProductType) ?: saved.productType
+        if (saved.store == "myket" && original == null && requested == null) return true
+        return if (requested == null) expected in setOf(PendingStoreProductType.LEGACY_IN_APP, PendingStoreProductType.CONSUMABLE)
+            else expected == pendingProductType(requested)
+    }
     private fun storeTombstone(operation: PendingStoreOperation, context: StoreV2Context): RejectedStoreEvidenceTombstone {
         fun combined(vararg values: Any?): String = digest(values.joinToString(":") { value ->
             val part = value?.toString().orEmpty()
@@ -1406,8 +1416,7 @@ internal class GoV2Client(
                                 // Pending journals above must still finish delivery/consume checkpoints.
                                 // A renewed subscription may retain its token but change its purchase time.
                                 val purchaseRefHash = digest(receipt.purchaseToken)
-                                if (!explicitRestore && !(context.market == InappifyMarket.MYKET &&
-                                        resolvedType == InappifyProductType.SUBSCRIPTION.name) && resolvedType in setOf(
+                                if (!explicitRestore && context.market != InappifyMarket.MYKET && resolvedType in setOf(
                                         InappifyProductType.NON_CONSUMABLE.name, InappifyProductType.SUBSCRIPTION.name) &&
                                     confirmedCustomerInfo?.entitlements.orEmpty().any {
                                         it.purchaseStoreRefHash == purchaseRefHash &&

@@ -77,6 +77,7 @@ internal class GoV2StoreService(
                 productIdentifier = state.text("productIdentifier"),
                 alreadyDelivered = state.bool("alreadyDelivered"),
                 requiresConsumption = state.bool("requiresConsumption"),
+                productType = state.long("productType")?.let { require(it in 1L..3L); it.toInt() },
             ), null, null), null, response.retryAfterSeconds)
         } catch (failure: V2Failure) {
             val details = failure.sdkError.details

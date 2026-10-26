@@ -263,7 +263,7 @@ internal class StoreV2Coordinator(
                         is ApiEvaluation.State -> {
                             when (
                                 val applied = applyState(
-                                    operation = operation,
+                                    savedOperation = operation,
                                     state = evaluated.state,
                                     context = context,
                                 )
@@ -324,7 +324,7 @@ internal class StoreV2Coordinator(
                         is ApiEvaluation.State -> {
                             when (
                                 val applied = applyState(
-                                    operation = operation,
+                                    savedOperation = operation,
                                     state = evaluated.state,
                                     context = context,
                                 )
@@ -379,7 +379,7 @@ internal class StoreV2Coordinator(
                         is ApiEvaluation.State -> {
                             when (
                                 val applied = applyState(
-                                    operation = operation,
+                                    savedOperation = operation,
                                     state = evaluated.state,
                                     context = context,
                                 )
@@ -522,7 +522,7 @@ internal class StoreV2Coordinator(
                             }
                             when (
                                 val applied = applyState(
-                                    operation = operation,
+                                    savedOperation = operation,
                                     state = evaluated.state,
                                     context = context,
                                 )
@@ -550,10 +550,21 @@ internal class StoreV2Coordinator(
     }
 
     private suspend fun applyState(
-        operation: PendingStoreOperation,
+        savedOperation: PendingStoreOperation,
         state: StorePurchaseState,
         context: StoreV2Context,
     ): AppliedState {
+        // evaluate() has checked the server's scope and committed purchase proof.
+        // Persist the resolved type before any delivery/consume side effect.
+        val resolvedType = serverMyketProductType(savedOperation, state)
+        val operation = if (resolvedType == null) savedOperation else savedOperation.copy(
+            productType = resolvedType,
+            deliveryAcknowledged = savedOperation.deliveryAcknowledged ||
+                (resolvedType == PendingStoreProductType.CONSUMABLE && state.alreadyDelivered == true),
+        )
+        if (operation != savedOperation && !stateStore.upsertPendingStoreOperation(operation)) {
+            return AppliedState.Outcome(storageFailure(savedOperation))
+        }
         return when (state.status) {
         StorePurchaseStatus.COMPLETED,
         StorePurchaseStatus.RESTORED,
@@ -565,10 +576,11 @@ internal class StoreV2Coordinator(
                         StorePurchaseStatus.ALREADY_PROCESSED -> false
                         StorePurchaseStatus.RESTORED -> true
                         StorePurchaseStatus.COMPLETED ->
-                            !operation.deliveryAcknowledged ||
+                            !(resolvedType == PendingStoreProductType.CONSUMABLE && state.alreadyDelivered == true) &&
+                            (!operation.deliveryAcknowledged ||
                                 operation.phase !=
                                 PendingStoreOperationPhase.CONSUME_RESULT_REPORTING ||
-                                operation.consumeResult != PendingStoreConsumeResult.SUCCEEDED
+                                operation.consumeResult != PendingStoreConsumeResult.SUCCEEDED)
                         else -> false
                     }
             if (invalidConsumableTerminal) {
@@ -584,7 +596,8 @@ internal class StoreV2Coordinator(
             // Myket sells a timed entitlement as an ordinary, repeatable in-app item.
             // Only the server's committed grant authorizes consumption; the signed
             // developer payload alone never authorizes consuming a user's purchase.
-            if (operation.store == "myket" && operation.productType == PendingStoreProductType.SUBSCRIPTION) {
+            if (operation.store == "myket" && (operation.productType == PendingStoreProductType.SUBSCRIPTION ||
+                    authorizesLegacyMyketConsumption(operation, state))) {
                 if (state.requiresConsumption != true || state.paymentId == null || state.eventId == null) {
                     return AppliedState.Outcome(permanentFailure(operation,
                         InappifyErrorCode.MALFORMED_RESPONSE,
@@ -880,6 +893,44 @@ internal class StoreV2Coordinator(
         }
     }
 
+    private fun serverMyketProductType(operation: PendingStoreOperation, state: StorePurchaseState): PendingStoreProductType? =
+        if (operation.store != "myket") null else when (state.productType) {
+            1 -> PendingStoreProductType.SUBSCRIPTION
+            2 -> PendingStoreProductType.CONSUMABLE
+            3 -> PendingStoreProductType.NON_CONSUMABLE
+            else -> null
+        }
+
+    private fun validMyketProductAuthority(operation: PendingStoreOperation, state: StorePurchaseState): Boolean {
+        val type = serverMyketProductType(operation, state) ?: return false
+        if (state.source != "myket" || state.productIdentifier != operation.productIdentifier ||
+            state.paymentId == null || state.paymentId <= 0 || state.eventId == null || state.eventId <= 0) return false
+        if (type != operation.productType && (operation.deliveryId != null || operation.phase !in setOf(
+                PendingStoreOperationPhase.REGISTERING, PendingStoreOperationPhase.VERIFYING))) return false
+        return when (type) {
+            PendingStoreProductType.SUBSCRIPTION -> state.requiresConsumption == true && state.deliveryId == null &&
+                state.status in setOf(StorePurchaseStatus.COMPLETED, StorePurchaseStatus.RESTORED, StorePurchaseStatus.ALREADY_PROCESSED)
+            PendingStoreProductType.NON_CONSUMABLE -> state.requiresConsumption == false && state.deliveryId == null &&
+                state.status in setOf(StorePurchaseStatus.COMPLETED, StorePurchaseStatus.RESTORED, StorePurchaseStatus.ALREADY_PROCESSED)
+            PendingStoreProductType.CONSUMABLE -> state.requiresConsumption != true && state.deliveryId != null &&
+                state.alreadyDelivered != null && when (state.status) {
+                    StorePurchaseStatus.DELIVERY_REQUIRED -> !state.alreadyDelivered
+                    StorePurchaseStatus.CONSUME_REQUIRED, StorePurchaseStatus.COMPLETED -> state.alreadyDelivered
+                    else -> false
+                }
+            else -> false
+        }
+    }
+
+    // Older Myket receipts do not declare productType. Only a committed, server-authorized
+    // subscription grant may resolve that ambiguity; never infer it from today's catalog.
+    private fun authorizesLegacyMyketConsumption(operation: PendingStoreOperation, state: StorePurchaseState): Boolean =
+        operation.store == "myket" && operation.productType == PendingStoreProductType.LEGACY_IN_APP &&
+            operation.phase in setOf(PendingStoreOperationPhase.REGISTERING, PendingStoreOperationPhase.VERIFYING) &&
+            operation.deliveryId == null && state.deliveryId == null && state.requiresConsumption == true &&
+            state.paymentId != null && state.paymentId > 0 && state.eventId != null && state.eventId > 0 &&
+            state.status in setOf(StorePurchaseStatus.COMPLETED, StorePurchaseStatus.RESTORED, StorePurchaseStatus.ALREADY_PROCESSED)
+
     private fun evaluate(
         result: StoreServiceResult,
         operation: PendingStoreOperation,
@@ -968,24 +1019,40 @@ internal class StoreV2Coordinator(
                 }
             } else {
                 val received = requireNotNull(payload.state)
-                val wrongScope = (operation.operation == PendingStoreOperationType.RECOVER_SUBSCRIPTION &&
-                    (received.source != operation.store || received.productIdentifier != operation.productIdentifier)) ||
-                    (received.requiresConsumption == true && (operation.store != "myket" ||
-                        operation.productType != PendingStoreProductType.SUBSCRIPTION)) ||
-                    (received.source != null && received.source != operation.store) ||
-                    (received.productIdentifier != null && received.productIdentifier != operation.productIdentifier) ||
-                    (received.verificationRequestId != null && operation.verificationRequestId != null &&
-                        received.verificationRequestId != operation.verificationRequestId) ||
-                    (received.deliveryId != null && operation.deliveryId != null && received.deliveryId != operation.deliveryId) ||
-                    (received.deliveryId != null && received.status !in setOf(
-                        StorePurchaseStatus.DELIVERY_REQUIRED, StorePurchaseStatus.CONSUME_REQUIRED) &&
-                        operation.productType in setOf(PendingStoreProductType.NON_CONSUMABLE, PendingStoreProductType.SUBSCRIPTION)) ||
-                    (received.alreadyDelivered == false && received.status == StorePurchaseStatus.CONSUME_REQUIRED) ||
-                    (received.alreadyDelivered == true && received.status == StorePurchaseStatus.DELIVERY_REQUIRED)
-                if (wrongScope) ApiEvaluation.Reject(InappifyError(
+                val resolvedType = serverMyketProductType(operation, received)
+                val effectiveType = resolvedType ?: operation.productType
+                val mismatches = buildList {
+                    if (operation.store == "myket" && received.productType != null && !validMyketProductAuthority(operation, received))
+                        add("SERVER_PRODUCT_TYPE")
+                    if (operation.operation == PendingStoreOperationType.RECOVER_SUBSCRIPTION &&
+                        (received.source != operation.store || received.productIdentifier != operation.productIdentifier))
+                        add("RECOVERY_SCOPE")
+                    if (received.requiresConsumption == true &&
+                        !(operation.store == "myket" && effectiveType == PendingStoreProductType.SUBSCRIPTION) &&
+                        !authorizesLegacyMyketConsumption(operation, received)) add("CONSUMPTION_AUTHORIZATION")
+                    if (received.source != null && received.source != operation.store) add("SOURCE")
+                    if (received.productIdentifier != null && received.productIdentifier != operation.productIdentifier) add("PRODUCT")
+                    if (received.verificationRequestId != null && operation.verificationRequestId != null &&
+                        received.verificationRequestId != operation.verificationRequestId) add("VERIFICATION_ID")
+                    if (received.deliveryId != null && operation.deliveryId != null && received.deliveryId != operation.deliveryId)
+                        add("DELIVERY_ID")
+                    if (received.deliveryId != null && received.status !in setOf(
+                            StorePurchaseStatus.DELIVERY_REQUIRED, StorePurchaseStatus.CONSUME_REQUIRED) &&
+                        effectiveType in setOf(PendingStoreProductType.NON_CONSUMABLE, PendingStoreProductType.SUBSCRIPTION))
+                        add("DELIVERY_PRODUCT_TYPE")
+                    if (received.alreadyDelivered == false && received.status == StorePurchaseStatus.CONSUME_REQUIRED ||
+                        received.alreadyDelivered == true && received.status == StorePurchaseStatus.DELIVERY_REQUIRED)
+                        add("DELIVERY_STATE")
+                }
+                if (mismatches.isNotEmpty()) ApiEvaluation.Reject(InappifyError(
                     code = InappifyErrorCode.MALFORMED_RESPONSE,
                     message = "The store response does not match the pending purchase scope or delivery state.",
-                    details = operation.safeDetails(context),
+                    details = operation.safeDetails(context) + mapOf(
+                        "scopeMismatches" to mismatches,
+                        "pendingProductType" to operation.productType.name,
+                        "responseStatus" to received.status.name,
+                        "requiresConsumption" to received.requiresConsumption,
+                    ),
                 ), requiresRejectionTombstone = false)
                 else ApiEvaluation.State(state = received)
             }

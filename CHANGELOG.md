@@ -1,3 +1,9 @@
+## 0.2.3
+
+- Use the committed server product type for Myket recovery, including receipts created by older SDKs with a different local type. Require matching purchase scope and committed payment/delivery evidence before changing recovery behavior.
+- Finish consumption of previously granted Myket subscriptions without extending access again; preserve durable consumable delivery and never consume non-consumable purchases. Keep Bazaar and Direct behavior unchanged.
+- Retain Myket receipts/checkpoints until reconciliation completes and expose the safe numeric Myket callback response code for failed purchases. Deploy the matching commerce backend before upgrading clients.
+
 ## 0.2.2
 
 - Support manually renewed Myket timed subscriptions using IN_APP purchases and server-authorized consumption after entitlement grant. Preserve consumable host delivery, lifetime ownership, Bazaar subscriptions and Direct behavior.

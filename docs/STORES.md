@@ -146,7 +146,30 @@ Test the final store-specific APK, matching signing/package identity, store acco
 - [Bazaar adapter](../sdk/src/main/kotlin/com/inappify/sdk/internal/billing/BazaarStoreBillingAdapter.kt), [Myket adapter](../sdk/src/main/kotlin/com/inappify/sdk/internal/billing/MyketStoreBillingAdapter.kt), [Myket receipt validation](../sdk/src/main/kotlin/com/inappify/sdk/internal/billing/MyketReceiptValidator.kt), and [Activity requirements](../sdk/src/main/kotlin/com/inappify/sdk/internal/billing/StoreUiHost.kt).
 - [Configure/purchase/reconciliation client](../sdk/src/main/kotlin/com/inappify/sdk/internal/v2/GoV2Client.kt), [product types](../sdk/src/main/kotlin/com/inappify/sdk/InappifyProductType.kt), [store statuses](../sdk/src/main/kotlin/com/inappify/sdk/InappifyStorePurchaseStatus.kt), and [consumable API](../sdk/src/main/kotlin/com/inappify/sdk/InappifyConsumableFulfillment.kt).
 
-## Myket timed subscriptions (Kotlin 0.2.2 / Flutter 0.2.3)
+## Myket timed subscriptions (Kotlin 0.2.3 / Flutter 0.2.4)
+
+Updated builds use the committed Myket purchase's server `productType`: `1` subscription,
+`2` consumable, `3` non-consumable. This is the type recorded for that purchase, not an
+unverified client declaration or a later catalog edit. A response must include matching
+`source`/`productIdentifier`, positive payment/event IDs, and consistent delivery/consumption
+state before it can correct an old SDK type. The resolved type is checkpointed without
+modifying the signed receipt. Existing delivery checkpoints cannot be reclassified.
+
+Subscriptions require a terminal response with `requiresConsumption: true` and no delivery
+ID before consuming. Consumables require server-confirmed delivery before consumption;
+already delivered or consumed purchases never call host fulfillment again. Non-consumables
+are never consumed. Failures retain the journal and successful consumption is checkpointed
+before finalization. Replaying an old granted subscription does not extend access again.
+
+Deploy the backend response changes before the updated SDK. Responses from older backends
+retain the previous compatibility checks; an explicit conflicting local type is not overridden
+without the new server proof. Bazaar behavior and response fields remain unchanged.
+
+Purchase failures retain the numeric Myket callback in `error.details.storeResponseCode`
+(for example, `7` is `ITEM_ALREADY_OWNED`), without forwarding the raw callback message.
+Scope failures include `scopeMismatches`, `pendingProductType`, `responseStatus`, and
+`requiresConsumption`; identifiers and receipt evidence remain private. These diagnostics
+are available in updated builds, not retroactively in logs from Kotlin 0.2.2.
 
 Follow [Myket's Java documentation](https://myket.ir/kb/pages/java/): Myket does not offer native subscriptions. Register a **consumable** SKU in Myket for each timed plan; map the same SKU to **SUBSCRIPTION** in Inappify and set its package duration. Keep lifetime SKUs non-consumable in both catalogs. Ordinary consumables keep their existing host delivery/confirmation flow.
 

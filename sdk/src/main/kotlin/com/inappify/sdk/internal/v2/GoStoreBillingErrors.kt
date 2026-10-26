@@ -25,5 +25,6 @@ internal fun StoreBillingError.toGoPurchaseError(attemptId: String, store: Strin
     return InappifyError(publicCode, "The marketplace purchase did not complete reliably.",
         isRetryable = isRetryable && !uncertain,
         details = mapOf("operation" to "purchase", "attemptId" to attemptId, "store" to store,
-            "storeCode" to code.name, "outcomeMayHaveCommitted" to uncertain))
+            "storeCode" to code.name, "outcomeMayHaveCommitted" to uncertain) +
+            (storeResponseCode?.let { mapOf("storeResponseCode" to it) } ?: emptyMap()))
 }

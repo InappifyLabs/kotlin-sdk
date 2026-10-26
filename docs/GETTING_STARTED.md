@@ -1,6 +1,6 @@
 # Getting started
 
-This guide uses `com.github.InappifyLabs:kotlin-sdk:v0.2.2` and the public
+This guide uses `com.github.InappifyLabs:kotlin-sdk:v0.2.3` and the public
 Kotlin package `com.inappify.sdk`. Follow [installation](../README.md#install)
 first. All SDK operations below are suspend functions unless stated otherwise.
 
@@ -163,7 +163,7 @@ suspend fun offeringForPaywall(
 
 Fresh offerings requests flush the durable attribute queue first. The server
 performs targeting using the current session, queued attributes, country,
-appVersion and SDK version `0.2.2`. Configure/snapshots use this exact
+appVersion and SDK version `0.2.3`. Configure/snapshots use this exact
 version without the tag prefix; the client does not
 normalize it locally for selection. SDK version is separate from your app
 version. Current selection uses a matching placement offering, then the server's

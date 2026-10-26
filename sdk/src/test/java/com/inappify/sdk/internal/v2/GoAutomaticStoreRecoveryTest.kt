@@ -7,6 +7,7 @@ import com.google.gson.JsonObject
 import com.google.gson.JsonPrimitive
 import com.inappify.sdk.*
 import com.inappify.sdk.internal.billing.*
+import com.inappify.sdk.internal.billing.StoreConsumeResult
 import com.inappify.sdk.internal.network.*
 import com.inappify.sdk.internal.platform.AppMetadata
 import com.inappify.sdk.internal.platform.AppMetadataProvider
@@ -686,6 +687,35 @@ class GoAutomaticStoreRecoveryTest {
         assertEquals(listOf(InappifyMarket.MYKET), fixture.adapters)
     }
 
+    @Test fun serverTypedMyketReceiptWithCommittedGrantFinishesConsumptionWithoutHostGrant() = runBlocking {
+        for ((type, persisted) in listOf<InappifyProductType?>(null, InappifyProductType.NON_CONSUMABLE,
+            InappifyProductType.CONSUMABLE, InappifyProductType.SUBSCRIPTION)
+            .flatMap { type -> listOf(false, true).map { type to it } }) {
+            val fixture = Fixture(InappifyMarket.MYKET, recoveryEnabled = false)
+            fixture.setServerReceipt(fixture.token, fixture.signing.now)
+            fixture.seedConfiguredSession()
+            val receipt = fixture.receipt(type = type)
+            if (persisted) fixture.storage.operations += fixture.pending(receipt,
+                type?.let { PendingStoreProductType.valueOf(it.name) } ?: PendingStoreProductType.LEGACY_IN_APP)
+            else fixture.owned[StoreProductType.IN_APP] = StorePurchaseQueryResult.Success(listOf(receipt))
+            fixture.consumeResult = StoreConsumeResult.Success
+            fixture.commerceTransport.handler = { request ->
+                assertEquals("store/purchases", request.path)
+                assertEquals("product", jsonObject(request.jsonBody).string("productIdentifier"))
+                fixture.commerceTransport.response(jsonObject("""{"status":true,"data":{"purchase":{
+                    "status":"COMPLETED","alreadyProcessed":true,"requiresConsumption":true,
+                    "paymentId":11,"eventId":12,"verificationRequestId":13,"deliveryId":null,
+                    "productType":1,"source":"myket","productIdentifier":"product"}}}"""))
+            }
+            assertTrue(fixture.automaticRecovery(InappifyConsumableDeliveryHandler {
+                error("Previously granted subscription must never call host delivery")
+            }) is InappifyResult.Success)
+            assertEquals(listOf(receipt.purchaseToken), fixture.consumedTokens)
+            assertTrue(fixture.storage.operations.isEmpty())
+            assertEquals(1, fixture.commerceTransport.requests.size)
+        }
+    }
+
     @Test fun explicitSyncUsesVerifiedServerHashAndTime() = runBlocking {
         val fixture = Fixture()
         fixture.setServerReceipt(fixture.token, fixture.signing.now)
@@ -713,6 +743,8 @@ class GoAutomaticStoreRecoveryTest {
         val owned = ConcurrentHashMap<StoreProductType, StorePurchaseQueryResult>()
         val queried = CopyOnWriteArrayList<StoreProductType>()
         val adapters = CopyOnWriteArrayList<InappifyMarket>()
+        val consumedTokens = CopyOnWriteArrayList<String>()
+        var consumeResult: StoreConsumeResult? = null
         @Volatile var serverEntitlements = JsonArray()
         @Volatile var customerInfoFail = false
         @Volatile var offeringsFail = false
@@ -788,6 +820,11 @@ class GoAutomaticStoreRecoveryTest {
                             if (gate.started.complete(Unit)) gate.release.await()
                         }
                         return owned[productType] ?: StorePurchaseQueryResult.Success(emptyList())
+                    }
+                    override suspend fun consume(purchase: StorePurchase): StoreConsumeResult {
+                        val result = consumeResult ?: return super.consume(purchase)
+                        consumedTokens += purchase.purchaseToken
+                        return result
                     }
                     override fun close() = Unit
                 }
