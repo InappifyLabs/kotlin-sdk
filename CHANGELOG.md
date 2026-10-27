@@ -1,3 +1,13 @@
+## 0.2.7
+
+- Schedule pending Android purchase recovery after ten minutes while foreground and connected, reusing the existing serialized recovery and each store/Direct verification contract. Resume on reconnect/startup; preserve unknown results and never expire evidence or automatically charge again.
+
+- Track Myket preparation separately from payment dispatch. Run blocking billing preparation off the UI thread, prevent late payment screens after timeout, and resolve interrupted preparation only when persisted evidence proves payment was not dispatched. Preserve uncertain dispatched/legacy attempts and confirmed cancellation semantics.
+- Keep Bazaar and Direct outside the Myket preparation policy; preserve purchase records, receipt recovery and entitlement deduplication.
+
+- Use package trial days and customer eligibility to call the existing `purchase` route before opening Bazaar or Myket payment. Finish on `DONE`, continue to the marketplace on `NEEDSTORE`, and route known ineligible purchases directly to billing. Preserve uncertain trial checks across restart without duplicate grants.
+- Requires the matching Laravel `purchase` behavior and `native_purchase_attempts.is_trial_check` migration before upgrading clients. Trial decisions share the existing attempt ledger; no additional table, route or trial-only request flag is required. Existing paid store receipt verification and recovery keep their existing path.
+
 ## 0.2.6
 
 - Add build-time `myket`, `bazaar`, `direct`, and `allStores` packaging. Include Poolakey only in Bazaar/allStores and Myket code, resources and manifest components only in Myket/allStores.

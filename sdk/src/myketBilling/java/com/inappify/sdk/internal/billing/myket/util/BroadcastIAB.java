@@ -213,7 +213,7 @@ public class BroadcastIAB extends IAB {
         Intent intent = new Intent(activity, ProxyBillingActivity.class);
         intent.putExtra(RESPONSE_BUY_INTENT, purchaseIntent);
         intent.putExtra(BILLING_RECEIVER_KEY, purchaseResultReceiver);
-        activity.startActivity(intent);
+        launchPurchaseActivity(activity, intent);
     }
 
     private void handleBillingSupport(Bundle bundle) {

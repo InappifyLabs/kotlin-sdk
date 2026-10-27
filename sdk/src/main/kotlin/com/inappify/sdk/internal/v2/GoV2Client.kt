@@ -51,6 +51,7 @@ internal class GoV2Client(
     private val connectivityMonitor: NetworkConnectivityMonitor = AlwaysConnectedMonitor(),
     private val recoveryRefreshPolicy: RecoveryRefreshPolicy = RecoveryRefreshPolicy(),
     private val paymentLinkMonitor: PaymentLinkMonitor = NoPaymentLinkMonitor(),
+    private val pendingRecoveryDelay: suspend (Long) -> Unit = { delay(it) },
 ) : InappifyV2Client, StoreV2CapableClient, ConsumableFulfillmentCapableClient, HttpDiagnosticsCapableClient,
     InappifyV2RuntimeCapabilities, TargetingSyncCapableClient, PurchaseAttemptCapableClient {
     constructor(config: InappifyV2Configuration, sdkApi: GoApi, storage: SessionStateStore,
@@ -66,10 +67,11 @@ internal class GoV2Client(
         offeringsRefreshPolicy: OfferingsRefreshPolicy = OfferingsRefreshPolicy(),
         connectivityMonitor: NetworkConnectivityMonitor = AlwaysConnectedMonitor(),
         recoveryRefreshPolicy: RecoveryRefreshPolicy = RecoveryRefreshPolicy(),
-        paymentLinkMonitor: PaymentLinkMonitor = NoPaymentLinkMonitor()) :
+        paymentLinkMonitor: PaymentLinkMonitor = NoPaymentLinkMonitor(),
+        pendingRecoveryDelay: suspend (Long) -> Unit = { delay(it) }) :
         this(GoV2Environment.explicit(config), sdkApi, storage, metadata, now, eventDispatcher, backgroundRecovery,
             countryResolver, commerceApi, billingFactory, targetingSyncLimiter, subscriptionRecoveryEnabled,
-            foregroundMonitor, offeringsRefreshPolicy, connectivityMonitor, recoveryRefreshPolicy, paymentLinkMonitor)
+            foregroundMonitor, offeringsRefreshPolicy, connectivityMonitor, recoveryRefreshPolicy, paymentLinkMonitor, pendingRecoveryDelay)
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val mutex = Mutex()
@@ -93,6 +95,8 @@ internal class GoV2Client(
     private var document = JsonObject()
     private var deliveryHandler: InappifyConsumableDeliveryHandler? = null
     private val attemptHistory = PurchaseAttemptHistory(storage as? PurchaseAttemptStorage)
+    private val pendingPurchaseRecoveryPolicy = PendingPurchaseRecoveryPolicy()
+    private var pendingPurchaseRecoveryJob: Job? = null
     private var renewalFailure: V2Failure? = null
     private var nextRenewalAt = 0L
     private var detectedCountry: String? = null
@@ -791,7 +795,14 @@ internal class GoV2Client(
         requireSession(); readPurchaseAttempts()
     }
     private suspend fun readPurchaseAttempts(): List<InappifyPurchaseAttempt> = try {
-        java.util.Collections.unmodifiableList(attemptHistory.list(currentAttemptBinding()))
+        val binding = currentAttemptBinding()
+        val attempts = attemptHistory.list(binding)
+        // Calls are serialized with purchase. Only explicit pre-launch proof can
+        // resolve an interrupted preparation; legacy and dispatched rows stay pending.
+        for (attempt in attempts) if (MyketPurchasePreparation.isPreparing(attempt)) {
+            recordAttempt(binding, MyketPurchasePreparation.interrupted(attempt, now()))
+        }
+        java.util.Collections.unmodifiableList(attemptHistory.list(binding))
     } catch (cancelled: CancellationException) { throw cancelled }
       catch (_: Exception) { fail("STORAGE", "PURCHASE_ATTEMPT_HISTORY_UNAVAILABLE") }
 
@@ -812,6 +823,7 @@ internal class GoV2Client(
           catch (_: Exception) { fail("STORAGE", "PURCHASE_ATTEMPT_RESULT_NOT_PERSISTED",
             diagnostics = mapOf("outcomeMayHaveCommitted" to outcomeMayHaveCommitted, "attemptId" to value.attemptId)) }
         if (emit) emitPurchaseAttempt(binding, recorded)
+        armPendingPurchaseRecovery()
         return recorded
     }
     private fun emitPurchaseAttempt(binding: String, value: InappifyPurchaseAttempt) {
@@ -1125,7 +1137,8 @@ internal class GoV2Client(
         val coordinator = storeCoordinator ?: fail("CONFIGURATION", "LARAVEL_V2_NOT_CONFIGURED")
         val context = storeContext()
         if (context.marketKey.isNullOrBlank()) fail("CONFIGURATION", if (context.market == InappifyMarket.MYKET) "MYKET_PUBLIC_KEY_REQUIRED" else "BAZAAR_PUBLIC_KEY_REQUIRED")
-        val attemptId = request.idempotencyKey ?: UUID.randomUUID().toString()
+        val checkpoint = document.getAsJsonObject("storeTrialPreflight")
+        val attemptId = request.idempotencyKey ?: checkpoint?.string("attemptId") ?: UUID.randomUUID().toString()
         if (!attemptId.matches(Regex("[A-Za-z0-9_.:-]{1,128}"))) fail("VALIDATION", "PURCHASE_ATTEMPT_INVALID")
         val recovery = storage.loadPendingStoreRecoveryState() ?: fail("STORAGE", "STORE_RECOVERY_UNAVAILABLE")
         val existing = recovery.operations.firstOrNull { it.id == attemptId }
@@ -1166,26 +1179,64 @@ internal class GoV2Client(
                     details = mapOf("serverCode" to "MYKET_PAYLOAD_TOO_LARGE", "outcomeMayHaveCommitted" to false)))
             }
         } else payload.toString()
+        val selectedProduct = snapshot.offerings?.offerings
+            ?.firstOrNull { it.identifier == request.offeringIdentifier }?.packages
+            ?.firstOrNull { it.identifier == packageIdentifier && it.product?.identifier == request.productIdentifier }?.product
+        val mayHaveTrial = (selectedProduct?.trialDays?.let { it > 0 } ?: true) &&
+            snapshot.customerInfo?.hasUsedTrial != true
+        // Always resolve an uncertain claim, even if refreshed metadata now says
+        // the customer used their trial (the lost response may be that grant).
+        if ((checkpoint != null || mayHaveTrial) && claimStoreTrial(request, nativePackageIdentifier, attemptId, context.market)) {
+            val purchase = InappifyPurchase(attemptId, request.productIdentifier, request.offeringIdentifier,
+                context.market, InappifyPurchaseStatus.DONE, packageIdentifier)
+            recordAttempt(binding, InappifyPurchaseAttempt(attemptId, request.productIdentifier,
+                request.offeringIdentifier, context.market, InappifyPurchaseAttemptStatus.SUCCEEDED, purchase, null, now()))
+            commit(document.deepCopy().apply { remove("storeTrialPreflight") })
+            return purchase
+        }
+        if (document.has("storeTrialPreflight")) commit(document.deepCopy().apply { remove("storeTrialPreflight") })
         recordAttempt(binding, InappifyPurchaseAttempt(attemptId, request.productIdentifier, request.offeringIdentifier,
             context.market, InappifyPurchaseAttemptStatus.PENDING, null, null, now()), outcomeMayHaveCommitted = false)
         val adapter = createBillingAdapter(context.marketKey, context.market)
+        val tracksLaunch = context.market == InappifyMarket.MYKET && adapter is StorePurchaseLaunchTracking
+        val dispatched = java.util.concurrent.atomic.AtomicBoolean()
         val receipt = try {
+            if (tracksLaunch) recordAttempt(binding, InappifyPurchaseAttempt(attemptId, request.productIdentifier,
+                request.offeringIdentifier, context.market, InappifyPurchaseAttemptStatus.PENDING, null,
+                MyketPurchasePreparation.preparingError(), now()), outcomeMayHaveCommitted = false)
+            val beforeLaunch: (suspend () -> Unit)? = if (!tracksLaunch) null else suspend {
+                val saved = recordAttempt(binding, InappifyPurchaseAttempt(attemptId, request.productIdentifier,
+                    request.offeringIdentifier, context.market, InappifyPurchaseAttemptStatus.PENDING, null,
+                    MyketPurchasePreparation.dispatchedError(), now()), outcomeMayHaveCommitted = false)
+                check(saved.status == InappifyPurchaseAttemptStatus.PENDING &&
+                    saved.error?.details?.get("serverCode") == "MYKET_PURCHASE_DISPATCHED")
+                dispatched.set(true)
+            }
             when (val billed = adapter.purchase(StoreUiHost.from(host), StorePurchaseRequest(
                 request.productIdentifier,
                 if (context.market == InappifyMarket.BAZAAR && request.productType == InappifyProductType.SUBSCRIPTION) StoreProductType.SUBSCRIPTION
-                else StoreProductType.IN_APP, developerPayload))) {
-                is StoreBillingResult.Success -> billed.purchase
+                else StoreProductType.IN_APP, developerPayload, beforeStoreLaunch = beforeLaunch))) {
+                is StoreBillingResult.Success -> {
+                    // Successful evidence must never remain classified as preparation,
+                    // including adapters that return an already-owned receipt directly.
+                    if (tracksLaunch && !dispatched.get()) beforeLaunch?.invoke()
+                    billed.purchase
+                }
                 is StoreBillingResult.Cancelled -> throw V2Failure(InappifyError(InappifyErrorCode.PURCHASE_CANCELLED,
                     "The marketplace purchase was cancelled."))
                 is StoreBillingResult.Failure -> throw V2Failure(billed.error.toGoPurchaseError(attemptId, context.store))
             }
         } catch (failure: V2Failure) {
-            val definitive = failure.sdkError.code == InappifyErrorCode.PURCHASE_CANCELLED &&
-                failure.sdkError.details["outcomeMayHaveCommitted"] != true
+            val beforeDispatch = tracksLaunch && !dispatched.get()
+            val error = if (!beforeDispatch) failure.sdkError else InappifyError(failure.sdkError.code,
+                failure.sdkError.message, isRetryable = true,
+                details = failure.sdkError.details + mapOf("outcomeMayHaveCommitted" to false))
+            val definitive = beforeDispatch || error.code == InappifyErrorCode.PURCHASE_CANCELLED &&
+                error.details["outcomeMayHaveCommitted"] != true
             recordAttempt(binding, InappifyPurchaseAttempt(attemptId, request.productIdentifier, request.offeringIdentifier,
                 context.market, if (definitive) InappifyPurchaseAttemptStatus.FAILED else InappifyPurchaseAttemptStatus.PENDING,
-                null, safeAttemptError(failure.sdkError), now()))
-            throw failure
+                null, safeAttemptError(error), now()))
+            throw V2Failure(error)
         } finally { releaseBillingAdapter(adapter) }
         if (receipt.productIdentifier != request.productIdentifier || receipt.packageName != context.appIdentifier ||
             runCatching { JsonParser.parseString(receipt.developerPayload) == JsonParser.parseString(developerPayload) }
@@ -1209,6 +1260,60 @@ internal class GoV2Client(
         finalizeRejectedStoreOutcome(outcome, context)
         return storePurchaseResult(outcome, packageIdentifier)
     }
+    /** Only the authenticated server may decide whether marketplace UI is needed. */
+    private suspend fun claimStoreTrial(request: InappifyPurchaseRequest, packageIdentifier: String?,
+        attemptId: String, market: InappifyMarket): Boolean {
+        val opt = options ?: fail("CONFIGURATION", "NOT_CONFIGURED")
+        val expected = JsonObject().apply {
+            addProperty("endpoint", storeFingerprint(opt))
+            addProperty("binding", currentAttemptBinding())
+            addProperty("attemptId", attemptId)
+            addProperty("productIdentifier", request.productIdentifier)
+            addProperty("offeringIdentifier", request.offeringIdentifier)
+            addProperty("packageIdentifier", packageIdentifier ?: fail("VALIDATION", "PACKAGE_IDENTIFIER_REQUIRED"))
+        }
+        val saved = document.getAsJsonObject("storeTrialPreflight")
+        if (saved != null && saved != expected) fail("VALIDATION", "STORE_TRIAL_PENDING",
+            diagnostics = mapOf("outcomeMayHaveCommitted" to true))
+        // Persist before HTTP, including generated attempt IDs, so a lost grant response
+        // is replayed after restart instead of accidentally opening a paid purchase.
+        commit(document.deepCopy().apply { add("storeTrialPreflight", expected) })
+        val intent = InappifyPurchase(attemptId, request.productIdentifier, request.offeringIdentifier,
+            market, packageIdentifier = packageIdentifier)
+        recordAttempt(currentAttemptBinding(), InappifyPurchaseAttempt(attemptId, request.productIdentifier,
+            request.offeringIdentifier, market, InappifyPurchaseAttemptStatus.PENDING, intent, null, now()),
+            outcomeMayHaveCommitted = false)
+        try {
+            val response = commerceRequest("purchase", JsonObject().apply {
+                addProperty("attemptId", attemptId)
+                addProperty("productIdentifier", request.productIdentifier)
+                addProperty("offeringIdentifier", request.offeringIdentifier)
+                addProperty("packageIdentifier", packageIdentifier)
+            }).body
+            val status = response.getAsJsonObject("data")?.get("purchaseStatus")
+            if (status == null || !status.isJsonPrimitive || !status.asJsonPrimitive.isString)
+                fail("DECODING", "INVALID_STORE_TRIAL_RESPONSE")
+            return when (status.asString) {
+                "DONE" -> true
+                "NEEDSTORE" -> false
+                else -> fail("DECODING", "INVALID_STORE_TRIAL_RESPONSE")
+            }
+        } catch (failure: V2Failure) {
+            val status = failure.sdkError.details["httpStatus"] as? Int
+            if (status != null && status in 400..499) {
+                // This endpoint commits only successful decisions. An explicit rejection
+                // can be corrected without stranding an unresolved checkpoint forever.
+                commit(document.deepCopy().apply { remove("storeTrialPreflight") })
+                recordAttempt(currentAttemptBinding(), InappifyPurchaseAttempt(attemptId, request.productIdentifier,
+                    request.offeringIdentifier, market, InappifyPurchaseAttemptStatus.FAILED, null,
+                    safeAttemptError(failure.sdkError), now()))
+                throw failure
+            }
+            throw V2Failure(InappifyError(failure.sdkError.code, failure.sdkError.message, failure.sdkError.isRetryable,
+                failure.sdkError.details + mapOf("outcomeMayHaveCommitted" to true)))
+        }
+    }
+
     private fun pendingProductType(type: InappifyProductType?): PendingStoreProductType = when (type) {
             InappifyProductType.CONSUMABLE -> PendingStoreProductType.CONSUMABLE
             InappifyProductType.NON_CONSUMABLE -> PendingStoreProductType.NON_CONSUMABLE
@@ -1912,11 +2017,21 @@ internal class GoV2Client(
         InappifyLogger.log(InappifyLogLevel.DEBUG) { "Recovery ${if (result is InappifyResult.Success) "completed" else "deferred after failure"}." }
         // Serialize completion with event admission. An event either joins the still-active
         // pass or sees its completed timestamp; it cannot launch a late duplicate between them.
-        mutex.withLock { recoveryRefreshPolicy.completed(generation, result is InappifyResult.Success) }
+        mutex.withLock {
+            recoveryRefreshPolicy.completed(generation, result is InappifyResult.Success)
+            if (generation == recoveryGeneration) {
+                pendingPurchaseRecoveryPolicy.checked(now())
+                armPendingPurchaseRecovery()
+            }
+        }
         return result
     }
 
     private suspend fun recoverConfiguredSession(automatic: Boolean): InappifyResult<Unit> {
+        if (snapshot.storePlatform == "MyKet") {
+            val history = run { requireSession(); readPurchaseAttempts() }
+            if (history is InappifyResult.Failure) return history
+        }
         val info = refreshCustomerInfo()
         if (nativeStoreMarket(snapshot.storePlatform) != null) {
             // Store recovery must not depend on catalog availability. A failed info refresh
@@ -1944,13 +2059,14 @@ internal class GoV2Client(
         if (reconnecting) scheduleRecoveryIfNeeded()
         if (enabled) { scheduleOfferingsRefresh(); scheduleCustomerInfoRefresh() }
     }
-    private fun scheduleRecovery() {
+    private suspend fun scheduleRecovery() {
         // Called while Configure/Login/Logout owns the state mutex. Startup still forces a
         // pass, except while offline/disabled or inside this customer's error backoff.
         if (canRecoverAutomatically() &&
             recoveryRefreshPolicy.shouldRecover(recoveryGeneration, pending = false, startup = true))
             recoveryCoordinator.request(automatic = true).also { rememberReturnRecovery() }
         wakePaymentReturns()
+        armPendingPurchaseRecovery()
     }
     private fun canRecoverAutomatically(): Boolean = backgroundRecovery && !closed && options != null &&
         document.has("session") && sdkApi.enabled && commerceApi?.enabled != false && connectivityMonitor.isConnected
@@ -1960,12 +2076,40 @@ internal class GoV2Client(
         if (!backgroundRecovery || closed || recoveryCoordinator.isRunning()) return
         scope.launch {
             mutex.withLock {
+                armPendingPurchaseRecovery()
                 if (!canRecoverAutomatically() || recoveryCoordinator.isRunning()) return@withLock
                 val pending = try { hasPendingRecovery() }
                 catch (cancelled: CancellationException) { throw cancelled }
                 catch (_: Exception) { true } // Let ordinary recovery report/check unreadable checkpoints.
                 if (recoveryRefreshPolicy.shouldRecover(recoveryGeneration, pending, startup = false))
                     recoveryCoordinator.request(automatic = true).also { rememberReturnRecovery() }
+            }
+        }
+    }
+
+    /** Called under the state mutex. Reuse the single recovery flight; never open payment UI. */
+    private suspend fun armPendingPurchaseRecovery() {
+        pendingPurchaseRecoveryJob?.cancel()
+        pendingPurchaseRecoveryJob = null
+        if (!canRecoverAutomatically() || !foregroundMonitor.isForeground || pendingLogin || pendingLogout ||
+            !snapshot.isConfigured || (nativeStoreMarket(snapshot.storePlatform) == null &&
+                snapshot.storePlatform != "DirectAndroid")) return
+        val binding = currentAttemptBinding()
+        val attempts = try { attemptHistory.list(binding) }
+        catch (cancelled: CancellationException) { throw cancelled }
+        catch (_: Exception) { return } // Do not turn unreadable evidence into a terminal result.
+        val wait = pendingPurchaseRecoveryPolicy.delayMillis(attempts, now()) ?: return
+        val generation = recoveryGeneration
+        pendingPurchaseRecoveryJob = scope.launch {
+            pendingRecoveryDelay(maxOf(wait, recoveryRefreshPolicy.retryDelayMillis(generation)))
+            mutex.withLock {
+                if (generation != recoveryGeneration || !canRecoverAutomatically() ||
+                    !foregroundMonitor.isForeground || pendingLogin || pendingLogout ||
+                    !snapshot.isConfigured || currentAttemptBinding() != binding) return@withLock
+                pendingPurchaseRecoveryJob = null
+                pendingPurchaseRecoveryPolicy.checked(now())
+                // Recovery's existing receipt/status checks alone may publish a terminal outcome.
+                recoveryCoordinator.request(automatic = true).also { rememberReturnRecovery() }
             }
         }
     }
@@ -2158,6 +2302,9 @@ internal class GoV2Client(
             recoverySubject = subject
             recoveryGeneration++
             recoveryRefreshPolicy.reset(recoveryGeneration)
+            pendingPurchaseRecoveryJob?.cancel()
+            pendingPurchaseRecoveryJob = null
+            pendingPurchaseRecoveryPolicy.reset()
         }
         currentSnapshot = nextSnapshot
         InappifyLogger.log(InappifyLogLevel.VERBOSE) { "SDK state revision ${nextSnapshot.revision} published." }

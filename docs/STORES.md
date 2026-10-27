@@ -73,9 +73,28 @@ A new paid store purchase requires `client.purchase(InappifyPurchaseParams.Build
 
 Use the visible checkout Activity for each invocation. Passing an application context or calling the overload without an Activity cannot start a new store purchase. The SDK keeps an invocation-scoped weak Activity reference, registers lifecycle-bound result handling, and cancels the operation if that host is destroyed. Store inventory queries and durable verification recovery do not need an Activity.
 
-Both adapters perform their billing setup/UI calls on the Android main thread; the public API is suspending. Coroutine cancellation propagates to the caller, and adapter cleanup disconnects or disposes billing resources. Closing the client cancels its work and billing adapters. Recreate a client after `close()`; do not close it after every checkout.
+Store UI dispatch runs on the Android main thread; Myket billing-support and buy-intent Binder calls run on bounded background workers. The public API is suspending. Coroutine cancellation propagates to the caller, and adapter cleanup disconnects or disposes billing resources. Closing the client cancels its work and billing adapters. Recreate a client after `close()`; do not close it after every checkout.
 
 ## Purchase a catalog package
+
+Kotlin 0.2.7 uses package trial days and cached `hasUsedTrial` to select
+the trial path before opening either Bazaar or Myket billing. Potentially eligible
+customers call the existing authenticated Laravel `POST /app/v2/purchase` route.
+An eligible subscription activates its trial and returns `purchaseStatus = DONE`
+without a store receipt. After this call, only an explicit `NEEDSTORE` decision opens billing;
+network errors and malformed decisions fail the purchase without charging.
+The attempt is persisted before the check, so retrying after a lost response or
+restart replays the original decision. Keep the same selected package and attempt
+ID while resolving an uncertain check. Existing paid receipt recovery runs first.
+Known ineligible customers and packages with zero trial days go directly to the
+marketplace. Unknown metadata triggers a server check. An uncertain persisted
+trial claim always replays, even if a refresh now shows `hasUsedTrial = true`.
+
+Deploy the matching Laravel backend and the migration adding `is_trial_check` to
+the existing `native_purchase_attempts` table
+before upgrading the native SDK. A Flutter application must also use a Flutter
+SDK release pinned to the changed Kotlin SDK; existing 0.2.6 binaries retain
+their previous behavior.
 
 Use the Package returned by the selected Offering. The SDK reads the product
 type supplied by Go V2 and adapts to the existing store purchase request:
@@ -180,3 +199,38 @@ Deploy the matching V2 commerce backend **before** distributing these SDKs: init
 Recovery examines bound Myket `IN_APP` receipts, including subscriptions already present in CustomerInfo, to finish consumption after process death. Explicit restore can reconcile an unconsumed bound subscription receipt; consumed history is obtained from server CustomerInfo for the same identity, not Myket inventory. Receipts without a valid customer/package binding are not adopted. Bazaar subscription, Direct checkout and V1 service behavior are unchanged.
 
 Release acceptance on a real Myket device: purchase each of the three product types; confirm lifetime remains owned, consumables wait for host delivery, and timed plans grant once then become buyable again. Repeat renewal, cancellation, network loss during verification/consumption, process death and restore. Automated mocks do not establish real-store acceptance.
+
+### Myket preparation versus dispatched payment (0.2.7)
+
+Myket V2 attempts persist `MYKET_PURCHASE_PREPARING` before billing setup. The
+adapter must durably replace it with `MYKET_PURCHASE_DISPATCHED` before opening
+the payment activity. Setup and buy-intent Binder calls run off the UI thread;
+late responses after timeout/close cannot open payment UI. Abandoned blocking
+work is bounded to one setup worker and one buy-intent worker.
+
+A failure before dispatch has `outcomeMayHaveCommitted: false` and a terminal
+failed attempt. A history lookup after restart also resolves an explicitly
+recorded preparation as `MYKET_PURCHASE_NOT_STARTED`. Confirmed store cancellation
+remains terminal. After dispatch, uncertain results retain their pending state.
+Legacy pending rows without phase evidence are never inferred to be unpaid from
+empty inventory or elapsed time. Bazaar and Direct do not use this policy.
+
+Hosts should preserve unresolved evidence and correlate attempts by customer,
+app, marketplace and product. An unresolved purchase need not globally disable unrelated products on any
+payment route; host journals must isolate app/customer/protocol/product context. Do not automatically retry the same uncertain charge or
+remove another product's journal after a successful recovery.
+
+### Pending recovery deadline (0.2.7)
+
+Android V2 schedules pending purchase reconciliation after ten minutes while
+configured, foreground and connected. It reuses the existing single recovery
+coordinator and each route's receipt/status checks (Myket, Bazaar, Android
+Direct). Existing startup/lifecycle/manual recovery may run earlier. Unresolved
+work is checked again after ten minutes; resume/reconnect restores scheduling,
+and process restart uses retained evidence and normal startup recovery.
+
+The deadline never expires or deletes evidence and never opens a new payment.
+Only a matching authoritative terminal result or proven pre-dispatch failure
+releases the corresponding attempt. Empty inventory, timeout or elapsed time is
+not proof of no charge. Hosts must independently scope their journal/guard by
+app/customer/protocol/product to avoid blocking unrelated purchases.

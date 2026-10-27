@@ -257,7 +257,18 @@ public class IabHelper {
         }
     }
 
+    private java.util.concurrent.Executor billingSupportExecutor;
+
+    public void setBillingSupportExecutor(java.util.concurrent.Executor executor) {
+        billingSupportExecutor = executor;
+    }
+
     private void checkBillingSupported(final OnIabSetupFinishedListener listener) {
+        if (billingSupportExecutor == null) checkBillingSupportedNow(listener);
+        else billingSupportExecutor.execute(() -> { if (!mDisposed) checkBillingSupportedNow(listener); });
+    }
+
+    private void checkBillingSupportedNow(final OnIabSetupFinishedListener listener) {
         String packageName = mContext.getPackageName();
         iabConnection.isBillingSupported(3, packageName, new BillingSupportCommunication() {
             @Override
@@ -350,6 +361,11 @@ public class IabHelper {
      *                  when the purchase completes. This extra data will be permanently bound to that purchase
      *                  and will always be returned when the purchase is queried.
      */
+    public void setPurchaseLauncher(com.inappify.sdk.internal.billing.myket.util.IAB.PurchaseLauncher launcher) {
+        checkSetupDone("setPurchaseLauncher");
+        iabConnection.setPurchaseLauncher(launcher);
+    }
+
     public void launchPurchaseFlow(Activity act, String sku, String itemType,
                                    OnIabPurchaseFinishedListener listener, String extraData) {
         checkNotDisposed();

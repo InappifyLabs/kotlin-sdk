@@ -1,6 +1,6 @@
-# Android store-specific builds (Flutter 0.2.6 / Kotlin 0.2.6)
+# Android store-specific builds (Flutter 0.2.7 / Kotlin 0.2.7)
 
-Flutter 0.2.6 requires Kotlin v0.2.6 with Gradle Module Metadata and all four
+Flutter 0.2.7 requires Kotlin v0.2.7 with Gradle Module Metadata and all four
 release AARs. Kotlin is published and distribution-verified before Flutter.
 Flutter 0.2.5 / Kotlin v0.2.4 still package both stores. An API key selects the
 server marketplace at runtime; it cannot change dependencies or permissions in an APK.
@@ -49,7 +49,7 @@ android {
     }
 }
 dependencies {
-    implementation("com.github.InappifyLabs:kotlin-sdk:v0.2.6")
+    implementation("com.github.InappifyLabs:kotlin-sdk:v0.2.7")
 }
 ```
 
@@ -82,10 +82,10 @@ or copy an AAR without its variant dependencies. The release must include the
 JitPack resolution before publishing Flutter; local artifact checks do not prove
 that the remote repository serves the new metadata correctly.
 
-### JitPack 0.2.6 artifact URL correction (direct Kotlin only)
+### JitPack 0.2.7 artifact URL correction (direct Kotlin only)
 
 JitPack currently drops the store classifier from file URLs in its generated
-`.module` metadata, although the classified AARs are available. Flutter 0.2.6
+`.module` metadata, although the classified AARs are available. Flutter 0.2.7
 applies the correction automatically to the host and plugin. Direct Kotlin
 consumers must add this rule alongside their dependency and dimension selection:
 
@@ -93,7 +93,7 @@ consumers must add this rule alongside their dependency and dimension selection:
 dependencies {
     components.withModule("com.github.InappifyLabs:kotlin-sdk") {
         val sdkTag = id.version
-        if (sdkTag == "v0.2.6") {
+        if (sdkTag == "v0.2.7") {
             for (store in listOf("allStores", "myket", "bazaar", "direct")) {
                 for (usage in listOf("Api", "Runtime")) {
                     withVariant("${store}ReleaseVariantRelease${usage}Publication") {

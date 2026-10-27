@@ -13,10 +13,15 @@ import kotlin.coroutines.resume
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /** Isolated Myket 1.6 integration. Poolakey and the host's own billing classes are untouched. */
 internal class MyketStoreBillingAdapter(context: Context, private val rsaPublicKey: String) :
-    StoreBillingAdapter, PartialStorePurchaseQueryAdapter {
+    StoreBillingAdapter, PartialStorePurchaseQueryAdapter, StorePurchaseLaunchTracking {
     private val context = context.applicationContext
     private val handler = Handler(Looper.getMainLooper())
     private val validator = MyketReceiptValidator(rsaPublicKey, this.context.packageName)
@@ -26,7 +31,7 @@ internal class MyketStoreBillingAdapter(context: Context, private val rsaPublicK
     override suspend fun purchase(uiHost: StoreUiHost, request: StorePurchaseRequest): StoreBillingResult {
         if (request.productType != StoreProductType.IN_APP || request.dynamicPriceToken != null ||
             request.productIdentifier.isBlank()) return StoreBillingResult.Failure(error(StoreBillingErrorCode.INVALID_REQUEST))
-        return operation<StoreBillingResult>(uiHost, { StoreBillingResult.Failure(it) }) { helper, complete ->
+        return operation<StoreBillingResult>(uiHost, { StoreBillingResult.Failure(it) }, request.beforeStoreLaunch) { helper, complete ->
             val activity = uiHost.activityOrNull()
             if (activity == null) complete(StoreBillingResult.Failure(error(StoreBillingErrorCode.UI_HOST_UNAVAILABLE)))
             else helper.launchPurchaseFlow(activity, request.productIdentifier, { result, purchase ->
@@ -89,6 +94,7 @@ internal class MyketStoreBillingAdapter(context: Context, private val rsaPublicK
     }
 
     private suspend fun <T> operation(host: StoreUiHost?, failure: (StoreBillingError) -> T,
+        beforeStoreLaunch: (suspend () -> Unit)? = null,
         start: (IabHelper, (T) -> Unit) -> Unit): T {
         if (closed.get()) return failure(error(StoreBillingErrorCode.ADAPTER_CLOSED))
         // Reject malformed configuration before a purchase UI can charge the customer.
@@ -139,9 +145,43 @@ internal class MyketStoreBillingAdapter(context: Context, private val rsaPublicK
                             if (done.get()) return@post
                             val client = IabHelper(context, rsaPublicKey)
                             helper = client
+                            if (beforeStoreLaunch != null) client.setBillingSupportExecutor { work ->
+                                if (!setupInFlight.compareAndSet(false, true)) {
+                                    finish(failure(error(StoreBillingErrorCode.PURCHASE_IN_PROGRESS, true)))
+                                } else CoroutineScope(Dispatchers.IO).launch {
+                                    try { if (!done.get() && continuation.isActive) work.run() }
+                                    catch (exception: Exception) { finish(failure(myketOperationException(exception, "SETUP"))) }
+                                    finally { setupInFlight.set(false) }
+                                }
+                            }
                             client.startSetup { result ->
                                 if (!done.get()) {
                                     if (!result.isSuccess) finish(failure(error(StoreBillingErrorCode.CONNECTION_FAILED, true)))
+                                    else if (beforeStoreLaunch != null) {
+                                        val launchRequested = AtomicBoolean()
+                                        client.setPurchaseLauncher { activity, intent ->
+                                            if (!done.get() && continuation.isActive && launchRequested.compareAndSet(false, true)) {
+                                                CoroutineScope(continuation.context).launch {
+                                                    try {
+                                                        beforeStoreLaunch()
+                                                        withContext(Dispatchers.Main.immediate) {
+                                                            if (!done.get() && continuation.isActive && !closed.get()) activity.startActivity(intent)
+                                                        }
+                                                    } catch (cancelled: CancellationException) { throw cancelled }
+                                                      catch (exception: Exception) { finish(failure(myketOperationException(exception, "OPERATION_START"))) }
+                                                }
+                                            }
+                                        }
+                                        // Binder calls preparing a buy intent can stall. They must not block
+                                        // the UI thread or launch a late payment after the timeout/close.
+                                        if (!preparationInFlight.compareAndSet(false, true)) {
+                                            finish(failure(error(StoreBillingErrorCode.PURCHASE_IN_PROGRESS, true)))
+                                        } else CoroutineScope(Dispatchers.IO).launch {
+                                            try { if (!done.get() && continuation.isActive) start(client, ::finish) }
+                                            catch (exception: Exception) { finish(failure(myketOperationException(exception, "OPERATION_START"))) }
+                                            finally { preparationInFlight.set(false) }
+                                        }
+                                    }
                                     else try { start(client, ::finish) }
                                     catch (exception: Exception) { finish(failure(myketOperationException(exception, "OPERATION_START"))) }
                                 }
@@ -161,5 +201,11 @@ internal class MyketStoreBillingAdapter(context: Context, private val rsaPublicK
     private fun error(code: StoreBillingErrorCode, retryable: Boolean = false): StoreBillingError =
         StoreBillingError(code, "Myket billing operation did not complete ($code).", retryable)
 
-    private companion object { val operations = Mutex() }
+    private companion object {
+        val operations = Mutex()
+        // A stalled Binder call is not cancellable. Bound abandoned preparation
+        // work to one worker, while allowing the purchase caller to time out.
+        val preparationInFlight = AtomicBoolean()
+        val setupInFlight = AtomicBoolean()
+    }
 }

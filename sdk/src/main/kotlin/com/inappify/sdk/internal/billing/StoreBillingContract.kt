@@ -56,6 +56,9 @@ internal interface PartialStorePurchaseQueryAdapter {
     ): StorePurchaseQueryResult
 }
 
+/** Must await StorePurchaseRequest.beforeStoreLaunch before opening any payment UI. */
+internal interface StorePurchaseLaunchTracking
+
 /** Product categories understood by native billing adapters. */
 internal enum class StoreProductType {
     IN_APP,
@@ -77,6 +80,7 @@ internal class StorePurchaseRequest(
     val productType: StoreProductType = StoreProductType.IN_APP,
     val developerPayload: String? = null,
     val dynamicPriceToken: String? = null,
+    val beforeStoreLaunch: (suspend () -> Unit)? = null,
 ) {
 
     /** Omits all values that may carry developer- or server-controlled secrets. */

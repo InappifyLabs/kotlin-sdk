@@ -33,7 +33,10 @@ class GoBillingLifecycleTest(private val nativeMarket: InappifyMarket) {
         sdkTransport.handler = { request -> sdkTransport.response(
             if (request.path == "offerings") jsonObject("""{"status":true,"offerings":[{"identifier":"default","packages":[{"identifier":"package","product":{"identifier":"product"}}]}]}""")
             else fixture.envelope().apply { addProperty("storePlatform", if (nativeMarket == InappifyMarket.MYKET) 11 else 10); addProperty("storeInfo", "fixture-public-rsa") }) }
-        commerceTransport.handler = { error("Closing native billing must not send a receipt/consume report") }
+        commerceTransport.handler = { request ->
+            if (request.isStoreTrialPurchase()) commerceTransport.response(jsonObject("""{"status":true,"data":{"purchaseStatus":"NEEDSTORE"}}"""))
+            else error("Closing native billing must not send a receipt/consume report")
+        }
         return GoV2Client(fixture.config, GoApi(sdkTransport, { fixture.now }, {}), storage,
             AppMetadataProvider { AppMetadata("com.example.mobile", "2.4.0", 20400) },
             { fixture.now }, Dispatchers.Unconfined, backgroundRecovery = false,
@@ -72,7 +75,7 @@ class GoBillingLifecycleTest(private val nativeMarket: InappifyMarket) {
                 payload.get("purchaseBinding").asString)
             assertEquals("package", payload.get("nativePackageIdentifier").asString)
             assertTrue(payload.has("recoveryBinding"))
-            assertTrue(commerceTransport.requests.isEmpty())
+            assertTrue(commerceTransport.requests.filter { !it.isStoreTrialPurchase() }.isEmpty())
         }
     }
 
@@ -87,7 +90,7 @@ class GoBillingLifecycleTest(private val nativeMarket: InappifyMarket) {
         assertTrue(operation.isCancelled)
         assertTrue(currentCoroutineContext().isActive)
         assertEquals(1, adapterCloses)
-        assertTrue(commerceTransport.requests.isEmpty())
+        assertTrue(commerceTransport.requests.filter { !it.isStoreTrialPurchase() }.isEmpty())
     }
 
     @Test fun closeCancelsAnOwnedQueryAndClosesItsAdapter() = runBlocking {
@@ -100,7 +103,7 @@ class GoBillingLifecycleTest(private val nativeMarket: InappifyMarket) {
         assertTrue(operation.isCancelled)
         assertTrue(currentCoroutineContext().isActive)
         assertEquals(1, adapterCloses)
-        assertTrue(commerceTransport.requests.isEmpty())
+        assertTrue(commerceTransport.requests.filter { !it.isStoreTrialPurchase() }.isEmpty())
     }
 
     @Test fun callerCancellationClosesOnlyItsAdapterAndLeavesTheClientUsable() = runBlocking {
@@ -133,7 +136,7 @@ class GoBillingLifecycleTest(private val nativeMarket: InappifyMarket) {
         assertEquals(1, adapterCloses)
         assertEquals(PendingStoreOperationPhase.CONSUME_REQUIRED, storage.operations.single().phase)
         assertNull(storage.operations.single().consumeResult)
-        assertTrue(commerceTransport.requests.isEmpty())
+        assertTrue(commerceTransport.requests.filter { !it.isStoreTrialPurchase() }.isEmpty())
     }
 
     @Test fun uncertainBillingFailurePreservesAttemptAndDoesNotSuggestANewPurchase() = runBlocking {
@@ -150,7 +153,7 @@ class GoBillingLifecycleTest(private val nativeMarket: InappifyMarket) {
             assertFalse(result.error.isRetryable)
             assertFalse(result.error.toString().contains("private-store-value"))
             assertEquals(1, adapterCloses)
-            assertTrue(commerceTransport.requests.isEmpty())
+            assertTrue(commerceTransport.requests.filter { !it.isStoreTrialPurchase() }.isEmpty())
         }
     }
 
@@ -183,7 +186,7 @@ class GoBillingLifecycleTest(private val nativeMarket: InappifyMarket) {
             assertEquals("fixture-attempt", result.error.details["attemptId"])
             assertEquals("STORE_RECEIPT_SCOPE_MISMATCH", result.error.details["serverCode"])
             assertFalse(result.error.isRetryable)
-            assertTrue(commerceTransport.requests.isEmpty())
+            assertTrue(commerceTransport.requests.filter { !it.isStoreTrialPurchase() }.isEmpty())
         }
     }
 

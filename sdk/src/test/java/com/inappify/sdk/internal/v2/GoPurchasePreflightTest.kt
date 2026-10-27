@@ -67,6 +67,12 @@ class GoPurchasePreflightTest {
         @Volatile var processing = false
         @Volatile var deliveries = "[]"
         @Volatile var attemptStates = "[]"
+        var trialGranted = false
+        var trialFailure = false
+        var trialMalformed = false
+        var trialRejected = false
+        var catalogTrialDays: Long? = null
+        var usedTrial = false
         init {
             sdkTransport.handler = { request -> when (request.path) {
                 "configure", "login" -> {
@@ -77,12 +83,18 @@ class GoPurchasePreflightTest {
                     else sdkTransport.response(envelope())
                 "offerings" -> if (failCatalog) sdkTransport.response(jsonObject("""{"status":false,"code":"CATALOG_UNAVAILABLE"}"""), 503)
                     else sdkTransport.response(jsonObject("""{"status":true,"offerings":[
-                        {"identifier":"original","packages":[{"identifier":"original-package","product":{"identifier":"product"}}]},
-                        {"identifier":"new-offer","packages":[{"identifier":"new-package","product":{"identifier":"product"}},
+                        {"identifier":"original","packages":[{"identifier":"original-package","product":{"identifier":"product","trialDays":$catalogTrialDays}}]},
+                        {"identifier":"new-offer","packages":[{"identifier":"new-package","product":{"identifier":"product","trialDays":$catalogTrialDays}},
                         {"identifier":"other-package","product":{"identifier":"other"}}]}]}"""))
                 else -> error("Unexpected SDK request ${request.path}")
             } }
             commerce.handler = { request -> when {
+                request.isStoreTrialPurchase() -> when {
+                    trialFailure -> TransportResult.Failure(TransportFailureKind.TIMEOUT)
+                    trialRejected -> commerce.response(jsonObject("""{"status":false,"code":"INVALID_PRODUCT"}"""), 422)
+                    trialMalformed -> commerce.response(jsonObject("""{"status":true,"data":{"purchaseStatus":true}}"""))
+                    else -> commerce.response(jsonObject("""{"status":true,"data":{"purchaseStatus":"${if (trialGranted) "DONE" else "NEEDSTORE"}"}}"""))
+                }
                 request.path == "purchase" -> commerce.response(jsonObject("""{"status":true,"data":{
                     "purchaseStatus":"NEEDTOPAY","url":"https://pay.inappify.com/checkout/fixture"}}"""))
                 request.path == "purchase-attempts/status" -> commerce.response(jsonObject("""{"status":true,"data":{"attempts":$attemptStates}}"""))
@@ -110,6 +122,7 @@ class GoPurchasePreflightTest {
             commerceApi = GoApi(commerce, { clock }, {}),
             billingFactory = StoreBillingAdapterFactory { _, _ -> object : StoreBillingAdapter {
                 override suspend fun purchase(uiHost: StoreUiHost, request: StorePurchaseRequest): StoreBillingResult {
+                    if (catalogTrialDays != 0L && !usedTrial) assertTrue(commerce.requests.last().isStoreTrialPurchase())
                     val count = uiCalls.incrementAndGet()
                     if (purchaseCancelled) return StoreBillingResult.Cancelled
                     purchaseError?.let { return StoreBillingResult.Failure(it) }
@@ -124,7 +137,9 @@ class GoPurchasePreflightTest {
                 }
                 override fun close() = Unit
             } })
-        private fun envelope(): JsonObject = signing.envelope(customer).apply {
+        private fun envelope(): JsonObject = signing.envelope(customer, mutatePayload = { payload ->
+            payload.getAsJsonObject("customer_info").addProperty("hasUsedTrial", usedTrial)
+        }).apply {
             addProperty("storePlatform", when (market) { InappifyMarket.BAZAAR -> 10; InappifyMarket.MYKET -> 11; else -> 2 })
             addProperty("storeInfo", "fixture-rsa")
         }
@@ -157,6 +172,112 @@ class GoPurchasePreflightTest {
             .joinToString("") { "%02x".format(it) }
     }
 
+    @Test fun serverTrialCompletesWithoutOpeningEitherMarketplace() = runBlocking {
+        for (market in listOf(InappifyMarket.MYKET, InappifyMarket.BAZAAR)) {
+            val f = Fixture(market).apply { trialGranted = true; catalogTrialDays = 7 }
+            f.client().use { sdk ->
+                f.configure(sdk)
+                val result = sdk.purchase(Activity(), f.request(attempt = "trial-claim",
+                    type = InappifyProductType.SUBSCRIPTION)) as InappifyResult.Success
+                assertEquals(InappifyPurchaseStatus.DONE, result.data.purchaseStatus)
+                assertEquals(market, result.data.market)
+                assertEquals(0, f.uiCalls.get())
+                assertEquals(listOf("purchase"), f.commerce.requests.map { it.path })
+                val body = jsonObject(f.commerce.requests.single().jsonBody)
+                assertEquals("trial-claim", body.string("attemptId"))
+                assertEquals("new-package", body.string("packageIdentifier"))
+                assertEquals("new-offer", body.string("offeringIdentifier"))
+                assertTrue(f.storage.operations.isEmpty())
+                assertEquals(InappifyPurchaseAttemptStatus.SUCCEEDED,
+                    (sdk.getPurchaseAttempt("trial-claim") as InappifyResult.Success).data!!.status)
+            }
+        }
+    }
+
+    @Test fun explicitServerTrialDenialPrecedesMarketplacePayment() = runBlocking {
+        for (market in listOf(InappifyMarket.MYKET, InappifyMarket.BAZAAR)) {
+            val f = Fixture(market)
+            f.client().use { sdk ->
+                f.configure(sdk)
+                val result = sdk.purchase(Activity(), f.request())
+                assertTrue(result.toString(), result is InappifyResult.Success)
+                assertEquals(listOf("purchase", "store/purchases"), f.commerce.requests.map { it.path })
+                assertEquals(1, f.uiCalls.get())
+            }
+        }
+    }
+
+    @Test fun knownIneligibleCustomersAndPackagesWithoutTrialsGoStraightToTheStore() = runBlocking {
+        for (market in listOf(InappifyMarket.MYKET, InappifyMarket.BAZAAR)) {
+            for ((days, used) in listOf(0L to false, 7L to true)) {
+                val f = Fixture(market).apply { catalogTrialDays = days; usedTrial = used }
+                f.client().use { sdk ->
+                    f.configure(sdk)
+                    val result = sdk.purchase(Activity(), f.request())
+                    assertTrue(result.toString(), result is InappifyResult.Success)
+                    assertEquals(1, f.uiCalls.get())
+                    assertEquals(listOf("store/purchases"), f.commerce.requests.map { it.path })
+                    assertFalse(f.commerce.requests.any { it.isStoreTrialPurchase() })
+                }
+            }
+        }
+    }
+
+    @Test fun lostTrialResponseReplaysGeneratedAttemptAfterRestartWithoutStoreUI() = runBlocking {
+        for (market in listOf(InappifyMarket.MYKET, InappifyMarket.BAZAAR)) {
+            val f = Fixture(market).apply { trialFailure = true }
+            f.client().use { sdk ->
+                f.configure(sdk)
+                val result = sdk.purchase(Activity(), f.request(type = InappifyProductType.SUBSCRIPTION)) as InappifyResult.Failure
+                assertEquals(true, result.error.details["outcomeMayHaveCommitted"])
+                assertEquals(0, f.uiCalls.get())
+            }
+            val original = jsonObject(f.commerce.requests.single().jsonBody).string("attemptId")
+            f.trialFailure = false
+            f.trialGranted = true
+            // A refresh can now show that the lost server request used the trial.
+            // The persisted claim must still replay instead of opening paid UI.
+            f.usedTrial = true
+            f.client().use { sdk ->
+                f.configure(sdk)
+                val result = sdk.purchase(Activity(), f.request(type = InappifyProductType.SUBSCRIPTION)) as InappifyResult.Success
+                assertEquals(original, result.data.attemptId)
+                assertEquals(InappifyPurchaseStatus.DONE, result.data.purchaseStatus)
+                assertEquals(original, jsonObject(f.commerce.requests.last().jsonBody).string("attemptId"))
+                assertEquals(0, f.uiCalls.get())
+            }
+        }
+    }
+
+    @Test fun malformedTrialDecisionNeverFallsBackToPaymentOrReplacesPendingContext() = runBlocking {
+        for (market in listOf(InappifyMarket.MYKET, InappifyMarket.BAZAAR)) {
+            val f = Fixture(market).apply { trialMalformed = true }
+            f.client().use { sdk ->
+                f.configure(sdk)
+                val result = sdk.purchase(Activity(), f.request(attempt = "original-trial")) as InappifyResult.Failure
+                assertEquals("INVALID_STORE_TRIAL_RESPONSE", result.error.details["serverCode"])
+                val conflict = sdk.purchase(Activity(), f.request(product = "other", attempt = "new-trial")) as InappifyResult.Failure
+                assertEquals("STORE_TRIAL_PENDING", conflict.error.details["serverCode"])
+                assertEquals(1, f.commerce.requests.size)
+                assertEquals(0, f.uiCalls.get())
+            }
+        }
+    }
+
+    @Test fun explicitTrialValidationFailureAllowsACorrectedNewAttemptWithoutPayment() = runBlocking {
+        val f = Fixture().apply { trialRejected = true }
+        f.client().use { sdk ->
+            f.configure(sdk)
+            assertTrue(sdk.purchase(Activity(), f.request(attempt = "invalid-trial")) is InappifyResult.Failure)
+            assertEquals(0, f.uiCalls.get())
+            f.trialRejected = false
+            f.trialGranted = true
+            val result = sdk.purchase(Activity(), f.request(attempt = "corrected-trial")) as InappifyResult.Success
+            assertEquals(InappifyPurchaseStatus.DONE, result.data.purchaseStatus)
+            assertEquals(0, f.uiCalls.get())
+        }
+    }
+
     @Test fun confirmedSubscriptionCancellationSurvivesRestartAndAllowsNewAttempt() = runBlocking {
         for (market in listOf(InappifyMarket.MYKET, InappifyMarket.BAZAAR)) {
             val f = Fixture(market).apply { purchaseCancelled = true }
@@ -167,7 +288,7 @@ class GoPurchasePreflightTest {
                 assertEquals(InappifyErrorCode.PURCHASE_CANCELLED, result.error.code)
                 assertNotEquals(true, result.error.details["outcomeMayHaveCommitted"])
                 assertTrue(f.storage.operations.isEmpty())
-                assertTrue(f.commerce.requests.isEmpty())
+                assertTrue(f.commerce.requests.filter { !it.isStoreTrialPurchase() }.isEmpty())
             }
             f.client().use { sdk ->
                 f.configure(sdk)
@@ -179,7 +300,7 @@ class GoPurchasePreflightTest {
                     type = InappifyProductType.SUBSCRIPTION)) as InappifyResult.Failure
                 assertEquals(InappifyErrorCode.PURCHASE_CANCELLED, next.error.code)
                 assertEquals(2, f.uiCalls.get())
-                assertTrue(f.commerce.requests.isEmpty())
+                assertTrue(f.commerce.requests.filter { !it.isStoreTrialPurchase() }.isEmpty())
                 assertTrue((sdk.getPurchaseAttempts() as InappifyResult.Success).data.all { it.isFinal })
             }
         }
@@ -193,7 +314,7 @@ class GoPurchasePreflightTest {
             f.configure(sdk)
             val result = sdk.purchase(Activity(), f.request(attempt = "uncertain")) as InappifyResult.Failure
             assertEquals(-1002, result.error.details["storeResponseCode"])
-            assertTrue(f.commerce.requests.isEmpty())
+            assertTrue(f.commerce.requests.filter { !it.isStoreTrialPurchase() }.isEmpty())
         }
         f.client().use { sdk ->
             f.configure(sdk)
@@ -215,7 +336,7 @@ class GoPurchasePreflightTest {
             assertEquals("MYKET_PAYLOAD_TOO_LARGE", result.error.details["serverCode"])
             assertEquals(false, result.error.details["outcomeMayHaveCommitted"])
             assertEquals(0, f.uiCalls.get())
-            assertEquals(0, f.commerce.requests.size)
+            assertEquals(0, f.commerce.requests.filter { !it.isStoreTrialPurchase() }.size)
             assertTrue((sdk.getPurchaseAttempts() as InappifyResult.Success).data.isEmpty())
         }
     }
@@ -236,7 +357,7 @@ class GoPurchasePreflightTest {
             assertEquals("original", payload.string("offeringIdentifier"))
             assertEquals("original-package", payload.string("nativePackageIdentifier"))
             assertEquals(1, f.uiCalls.get())
-            assertEquals(listOf("store/purchases"), f.commerce.requests.map { it.path })
+            assertEquals(listOf("store/purchases"), f.commerce.requests.filter { !it.isStoreTrialPurchase() }.map { it.path })
         }
     }
 
@@ -248,7 +369,7 @@ class GoPurchasePreflightTest {
                 val result = sdk.purchase(Activity(), f.request()) as InappifyResult.Success
                 assertEquals(InappifyStorePurchaseStatus.COMPLETED, result.data.storePurchaseStatus)
                 assertEquals(1, f.uiCalls.get()); assertEquals(0, f.queryCalls.get())
-                assertEquals(listOf("store/purchases"), f.commerce.requests.map { it.path })
+                assertEquals(listOf("store/purchases"), f.commerce.requests.filter { !it.isStoreTrialPurchase() }.map { it.path })
                 assertEquals(listOf("customerInfo"), f.sdkTransport.requests.map { it.path })
             }
         }
@@ -282,7 +403,7 @@ class GoPurchasePreflightTest {
                 assertEquals("same-attempt", result.data!!.purchase!!.attemptId)
                 assertEquals(1, (restarted.getPurchaseAttempts() as InappifyResult.Success).data.size)
                 assertSame(cached, restarted.snapshot); assertSame(persisted, f.storage.value)
-                assertTrue(f.sdkTransport.requests.isEmpty()); assertTrue(f.commerce.requests.isEmpty())
+                assertTrue(f.sdkTransport.requests.isEmpty()); assertTrue(f.commerce.requests.filter { !it.isStoreTrialPurchase() }.isEmpty())
                 assertEquals(1, f.uiCalls.get())
             }
         }
@@ -420,7 +541,7 @@ class GoPurchasePreflightTest {
                 f.configure(sdk)
                 val result = sdk.purchase(f.request(attempt = "direct-attempt", type = type)) as InappifyResult.Success
                 assertEquals("direct-attempt", result.data.attemptId)
-                assertEquals("direct-attempt", jsonObject(f.commerce.requests.single { it.path == "purchase" }.jsonBody).string("attemptId"))
+                assertEquals("direct-attempt", jsonObject(f.commerce.requests.filter { !it.isStoreTrialPurchase() }.single { it.path == "purchase" }.jsonBody).string("attemptId"))
             }
             f.attemptStates = """[{"attemptId":"direct-attempt","productIdentifier":"product","offeringIdentifier":"new-offer",
                 "status":"SUCCEEDED","purchaseStatus":"DONE","url":null,"deliveryId":null,"deliveryStatus":null}]"""
@@ -434,7 +555,7 @@ class GoPurchasePreflightTest {
                 assertEquals(InappifyPurchaseAttemptStatus.SUCCEEDED, outcome.status)
                 assertEquals("new-package", outcome.purchase!!.packageIdentifier)
                 assertEquals("direct-attempt", updates.last().attemptId)
-                assertEquals(1, f.commerce.requests.count { it.path == "purchase" })
+                assertEquals(1, f.commerce.requests.filter { !it.isStoreTrialPurchase() }.count { it.path == "purchase" })
                 assertEquals(0, f.uiCalls.get())
             }
         }
@@ -451,7 +572,7 @@ class GoPurchasePreflightTest {
                 "status":"SUCCEEDED","purchaseStatus":"DONE"}]"""
             assertTrue(sdk.syncStorePurchases() is InappifyResult.Failure)
             assertFalse((sdk.getPurchaseAttempt("direct-attempt") as InappifyResult.Success).data!!.isFinal)
-            assertEquals(1, f.commerce.requests.count { it.path == "purchase" })
+            assertEquals(1, f.commerce.requests.filter { !it.isStoreTrialPurchase() }.count { it.path == "purchase" })
         }
     }
 
@@ -493,7 +614,7 @@ class GoPurchasePreflightTest {
                 assertEquals("original-package", result.data.packageIdentifier)
                 assertEquals(InappifyStorePurchaseStatus.COMPLETED, result.data.storePurchaseStatus)
                 assertEquals(0, f.uiCalls.get()); assertTrue(f.storage.operations.isEmpty())
-                assertEquals(listOf("store/verifications/9/status"), f.commerce.requests.map { it.path })
+                assertEquals(listOf("store/verifications/9/status"), f.commerce.requests.filter { !it.isStoreTrialPurchase() }.map { it.path })
             }
         }
     }
@@ -510,7 +631,7 @@ class GoPurchasePreflightTest {
             assertEquals(InappifyStorePurchaseStatus.DELIVERY_REQUIRED, result.data.storePurchaseStatus)
             assertEquals(7L, result.data.deliveryId); assertEquals(0, grants)
             assertEquals(listOf(pending), f.storage.operations.toList())
-            assertEquals(0, f.uiCalls.get()); assertTrue(f.commerce.requests.isEmpty())
+            assertEquals(0, f.uiCalls.get()); assertTrue(f.commerce.requests.filter { !it.isStoreTrialPurchase() }.isEmpty())
         }
     }
 
@@ -520,10 +641,10 @@ class GoPurchasePreflightTest {
             f.configure(sdk); f.storage.operations += f.pending()
             val result = sdk.purchase(Activity(), f.request()) as InappifyResult.Failure
             assertTrue(result.error.isRetryable); assertEquals(0, f.uiCalls.get())
-            assertEquals(1, f.commerce.requests.size)
+            assertEquals(1, f.commerce.requests.filter { !it.isStoreTrialPurchase() }.size)
             assertTrue(f.storage.operations.single().nextRetryAtEpochMillis!! >= f.signing.now + 120_000)
             assertTrue(sdk.purchase(Activity(), f.request()) is InappifyResult.Failure)
-            assertEquals(1, f.commerce.requests.size); assertEquals(0, f.uiCalls.get())
+            assertEquals(1, f.commerce.requests.filter { !it.isStoreTrialPurchase() }.size); assertEquals(0, f.uiCalls.get())
         }
     }
 
@@ -544,7 +665,7 @@ class GoPurchasePreflightTest {
                 f.storage.operations += foreign
                 assertTrue(sdk.purchase(Activity(), f.request()) is InappifyResult.Success)
                 assertEquals(1, f.uiCalls.get()); assertEquals(listOf(foreign), f.storage.operations.toList())
-                assertEquals(listOf("store/purchases"), f.commerce.requests.map { it.path })
+                assertEquals(listOf("store/purchases"), f.commerce.requests.filter { !it.isStoreTrialPurchase() }.map { it.path })
             }
         }
     }
@@ -555,7 +676,7 @@ class GoPurchasePreflightTest {
             f.configure(sdk); f.storage.unavailable = true
             val result = sdk.purchase(Activity(), f.request()) as InappifyResult.Failure
             assertEquals("STORE_RECOVERY_UNAVAILABLE", result.error.details["serverCode"])
-            assertEquals(0, f.uiCalls.get()); assertTrue(f.commerce.requests.isEmpty())
+            assertEquals(0, f.uiCalls.get()); assertTrue(f.commerce.requests.filter { !it.isStoreTrialPurchase() }.isEmpty())
         }
     }
 
@@ -578,8 +699,8 @@ class GoPurchasePreflightTest {
                 assertEquals("paid-attempt", result.data.attemptId)
                 assertEquals(InappifyStorePurchaseStatus.COMPLETED, result.data.storePurchaseStatus)
                 assertEquals(0, f.uiCalls.get())
-                assertEquals(1, f.commerce.requests.count { it.path == "store/deliveries/7/consume-result" })
-                assertFalse(f.commerce.requests.any { it.path == "store/purchases" })
+                assertEquals(1, f.commerce.requests.filter { !it.isStoreTrialPurchase() }.count { it.path == "store/deliveries/7/consume-result" })
+                assertFalse(f.commerce.requests.filter { !it.isStoreTrialPurchase() }.any { it.path == "store/purchases" })
             }
         }
     }
@@ -614,7 +735,7 @@ class GoPurchasePreflightTest {
             assertTrue(withTimeout(5_000) { recovery.await() } is InappifyResult.Failure)
             val result = withTimeout(5_000) { purchase.await() } as InappifyResult.Failure
             assertTrue(result.error.isRetryable); assertEquals(0, f.uiCalls.get())
-            assertEquals(1, f.commerce.requests.size)
+            assertEquals(1, f.commerce.requests.filter { !it.isStoreTrialPurchase() }.size)
         }
     }
 
@@ -699,7 +820,7 @@ class GoPurchasePreflightTest {
                 assertTrue(runCatching { withTimeout(5_000) { recovery.await() } }.exceptionOrNull() is CancellationException)
                 assertTrue(runCatching { withTimeout(5_000) { purchase.await() } }.exceptionOrNull() is CancellationException)
             }
-            assertEquals(0, f.uiCalls.get()); assertFalse(f.commerce.requests.any { it.path == "store/purchases" })
+            assertEquals(0, f.uiCalls.get()); assertFalse(f.commerce.requests.filter { !it.isStoreTrialPurchase() }.any { it.path == "store/purchases" })
         } finally { sdk.close() }
     }
 
@@ -707,13 +828,13 @@ class GoPurchasePreflightTest {
         val f = Fixture(market = null)
         f.client().use { sdk ->
             f.configure(sdk); f.seedDirect(sdk)
-            val queueReads = f.commerce.requests.count { it.path == "consumable-deliveries/pending" }
+            val queueReads = f.commerce.requests.filter { !it.isStoreTrialPurchase() }.count { it.path == "consumable-deliveries/pending" }
             val keys = jsonObject(f.storage.value!!.customerInfoJson!!).keySet().toSet()
             val result = sdk.purchase(f.request()) as InappifyResult.Success
             assertEquals(InappifyStorePurchaseStatus.DELIVERY_REQUIRED, result.data.storePurchaseStatus)
             assertEquals(7L, result.data.deliveryId); assertNull(result.data.url)
-            assertEquals(queueReads, f.commerce.requests.count { it.path == "consumable-deliveries/pending" })
-            assertFalse(f.commerce.requests.any { it.path == "purchase" || it.path.endsWith("/delivered") })
+            assertEquals(queueReads, f.commerce.requests.filter { !it.isStoreTrialPurchase() }.count { it.path == "consumable-deliveries/pending" })
+            assertFalse(f.commerce.requests.filter { !it.isStoreTrialPurchase() }.any { it.path == "purchase" || it.path.endsWith("/delivered") })
             val document = jsonObject(f.storage.value!!.customerInfoJson!!)
             assertEquals(keys, document.keySet())
             assertFalse(document.getAsJsonObject("directDeliveries").getAsJsonObject("records").getAsJsonObject("7").flag("hostDelivered"))
@@ -729,7 +850,7 @@ class GoPurchasePreflightTest {
             val result = sdk.purchase(f.request()) as InappifyResult.Success
             assertEquals(InappifyStorePurchaseStatus.COMPLETED, result.data.storePurchaseStatus)
             assertEquals(7L, result.data.deliveryId)
-            assertFalse(f.commerce.requests.any { it.path == "purchase" })
+            assertFalse(f.commerce.requests.filter { !it.isStoreTrialPurchase() }.any { it.path == "purchase" })
         }
     }
 
@@ -737,10 +858,10 @@ class GoPurchasePreflightTest {
         val f = Fixture(market = null)
         f.client().use { sdk ->
             f.configure(sdk); f.seedDirect(sdk); sdk.setNetworkEnabled(false)
-            val calls = f.commerce.requests.size
+            val calls = f.commerce.requests.filter { !it.isStoreTrialPurchase() }.size
             val result = sdk.purchase(f.request()) as InappifyResult.Failure
             assertEquals("V2_DISABLED", result.error.details["serverCode"])
-            assertEquals(calls, f.commerce.requests.size)
+            assertEquals(calls, f.commerce.requests.filter { !it.isStoreTrialPurchase() }.size)
         }
     }
 
@@ -752,7 +873,7 @@ class GoPurchasePreflightTest {
                 if (completed) assertTrue(sdk.confirmDelivery(7) is InappifyResult.Success)
                 val result = sdk.purchase(f.request()) as InappifyResult.Success
                 assertEquals(InappifyPurchaseStatus.NEEDTOPAY, result.data.purchaseStatus)
-                assertEquals(1, f.commerce.requests.count { it.path == "purchase" })
+                assertEquals(1, f.commerce.requests.filter { !it.isStoreTrialPurchase() }.count { it.path == "purchase" })
             }
         }
     }
@@ -773,10 +894,10 @@ class GoPurchasePreflightTest {
             val result = withTimeout(5_000) { purchase.await() } as InappifyResult.Success
             assertEquals(InappifyStorePurchaseStatus.COMPLETED, result.data.storePurchaseStatus)
             assertEquals(7L, result.data.deliveryId); assertEquals(1, grants)
-            assertFalse(f.commerce.requests.any { it.path == "purchase" })
+            assertFalse(f.commerce.requests.filter { !it.isStoreTrialPurchase() }.any { it.path == "purchase" })
             val fresh = sdk.purchase(f.request()) as InappifyResult.Success
             assertEquals(InappifyPurchaseStatus.NEEDTOPAY, fresh.data.purchaseStatus)
-            assertEquals(1, f.commerce.requests.count { it.path == "purchase" })
+            assertEquals(1, f.commerce.requests.filter { !it.isStoreTrialPurchase() }.count { it.path == "purchase" })
         }
     }
 
@@ -793,8 +914,8 @@ class GoPurchasePreflightTest {
             assertTrue(withTimeout(5_000) { recovery.await() } is InappifyResult.Failure)
             val result = withTimeout(5_000) { purchase.await() } as InappifyResult.Failure
             assertEquals("ACK_UNAVAILABLE", result.error.details["serverCode"])
-            assertEquals(1, f.commerce.requests.count { it.path.endsWith("/delivered") })
-            assertFalse(f.commerce.requests.any { it.path == "purchase" })
+            assertEquals(1, f.commerce.requests.filter { !it.isStoreTrialPurchase() }.count { it.path.endsWith("/delivered") })
+            assertFalse(f.commerce.requests.filter { !it.isStoreTrialPurchase() }.any { it.path == "purchase" })
         }
     }
 }

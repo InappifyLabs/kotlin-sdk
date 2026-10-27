@@ -29,6 +29,16 @@ import com.inappify.sdk.internal.billing.myket.util.communication.BillingSupport
 import com.inappify.sdk.internal.billing.myket.util.communication.OnBroadCastConnectListener;
 
 public abstract class IAB {
+    public interface PurchaseLauncher { void launch(Activity activity, Intent intent); }
+    private PurchaseLauncher purchaseLauncher;
+
+    public void setPurchaseLauncher(PurchaseLauncher launcher) { purchaseLauncher = launcher; }
+
+    protected void launchPurchaseActivity(Activity activity, Intent intent) {
+        if (mDisposed) return;
+        if (purchaseLauncher == null) activity.startActivity(intent);
+        else purchaseLauncher.launch(activity, intent);
+    }
 
     private final String mSignatureBase64;
     // Are subscriptions supported?

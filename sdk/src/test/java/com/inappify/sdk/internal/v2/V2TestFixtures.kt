@@ -55,6 +55,9 @@ internal class V2Transport : HttpTransport {
         TransportResult.Response(HttpResponse(status, body.toString(), null, headers = headers))
 }
 
+internal fun HttpRequest.isStoreTrialPurchase(): Boolean = path == "purchase" &&
+    runCatching { jsonObject(jsonBody).has("packageIdentifier") }.getOrDefault(false)
+
 internal class CommerceCatalogFixture {
     val offerings = """{"offerings":[{"identifier":"default","isDefault":true,"packages":[{"identifier":"package","product":{"identifier":"product"}}]}]}"""
 }

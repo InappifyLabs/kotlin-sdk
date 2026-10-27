@@ -207,7 +207,7 @@ public class ServiceIAB extends IAB {
         Intent intent = new Intent(act, ProxyBillingActivity.class);
         intent.putExtra(RESPONSE_BUY_INTENT, purchaseIntent);
         intent.putExtra(BILLING_RECEIVER_KEY, purchaseResultReceiver);
-        act.startActivity(intent);
+        launchPurchaseActivity(act, intent);
     }
 
     private void launchBuyIntent(
@@ -242,7 +242,7 @@ public class ServiceIAB extends IAB {
         Intent intent = new Intent(act, ProxyBillingActivity.class);
         intent.putExtra(RESPONSE_BUY_INTENT, pendingIntent);
         intent.putExtra(BILLING_RECEIVER_KEY, purchaseResultReceiver);
-        act.startActivity(intent);
+        launchPurchaseActivity(act, intent);
     }
 
     @Override
