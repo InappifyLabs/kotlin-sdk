@@ -16,6 +16,8 @@ provide iOS, Flutter, Google Play Billing or a JavaScript client.
 See [store-specific builds](docs/ANDROID_STORES.md) for **0.2.6**
 release, its required `missingDimensionStrategy`, and per-store dependencies.
 
+Direct Kotlin consumers of v0.2.6 also need the [JitPack artifact URL correction](docs/ANDROID_STORES.md#jitpack-026-artifact-url-correction-direct-kotlin-only).
+
 ## Install
 
 Use JDK 17 for Gradle. The SDK builds with Gradle 8.7, Android Gradle Plugin

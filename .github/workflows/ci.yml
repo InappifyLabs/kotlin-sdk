@@ -61,7 +61,7 @@ jobs:
           name: kotlin-sdk-${{ github.ref_name }}
           path: |
             sdk/build/outputs/aar/sdk-*-release.aar
-            sdk/build/libs/*-sources.jar
+            sdk/build/intermediates/source_jar/*Release/*-sources.jar
           if-no-files-found: error
 
       - name: Verify store-specific artifacts

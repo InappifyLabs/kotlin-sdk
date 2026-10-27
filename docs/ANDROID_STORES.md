@@ -82,6 +82,36 @@ or copy an AAR without its variant dependencies. The release must include the
 JitPack resolution before publishing Flutter; local artifact checks do not prove
 that the remote repository serves the new metadata correctly.
 
+### JitPack 0.2.6 artifact URL correction (direct Kotlin only)
+
+JitPack currently drops the store classifier from file URLs in its generated
+`.module` metadata, although the classified AARs are available. Flutter 0.2.6
+applies the correction automatically to the host and plugin. Direct Kotlin
+consumers must add this rule alongside their dependency and dimension selection:
+
+```kotlin
+dependencies {
+    components.withModule("com.github.InappifyLabs:kotlin-sdk") {
+        val sdkTag = id.version
+        if (sdkTag == "v0.2.6") {
+            for (store in listOf("allStores", "myket", "bazaar", "direct")) {
+                for (usage in listOf("Api", "Runtime")) {
+                    withVariant("${store}ReleaseVariantRelease${usage}Publication") {
+                        withFiles {
+                            removeAllFiles()
+                            addFile("kotlin-sdk-$sdkTag-${store}Release.aar")
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+This changes only artifact URLs and preserves each store's published dependency
+graph. Do not bypass Gradle Module Metadata or remove Poolakey from a Bazaar build.
+
 ## Safe workaround for Flutter 0.2.5
 
 Yes: removing the unrelated permission in the **app's store-specific manifest** is
