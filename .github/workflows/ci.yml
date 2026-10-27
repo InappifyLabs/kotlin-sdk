@@ -45,11 +45,14 @@ jobs:
       - name: Verify SDK and publication
         run: |
           ./gradlew --no-daemon --stacktrace \
-            :sdk:testDebugUnitTest \
-            :sdk:lintRelease \
+            :sdk:testAllStoresDebugUnitTest \
+            :sdk:testMyketReleaseUnitTest \
+            :sdk:testBazaarReleaseUnitTest \
+            :sdk:testDirectReleaseUnitTest \
+            :sdk:lintAllStoresRelease :sdk:lintMyketRelease :sdk:lintBazaarRelease :sdk:lintDirectRelease \
             :sdk:assembleRelease \
             :sdk:publishReleasePublicationToMavenLocal \
-            :sdk:assembleDebugAndroidTest
+            :sdk:assembleAllStoresDebugAndroidTest
 
       - name: Upload release artifacts
         if: startsWith(github.ref, 'refs/tags/')
@@ -57,6 +60,11 @@ jobs:
         with:
           name: kotlin-sdk-${{ github.ref_name }}
           path: |
-            sdk/build/outputs/aar/sdk-release.aar
+            sdk/build/outputs/aar/sdk-*-release.aar
             sdk/build/libs/*-sources.jar
           if-no-files-found: error
+
+      - name: Verify store-specific artifacts
+        run: |
+          ./gradlew :sdk:generateMetadataFileForReleasePublication
+          python3 tools/verify_store_artifacts.py

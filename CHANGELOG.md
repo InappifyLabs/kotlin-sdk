@@ -1,3 +1,9 @@
+## 0.2.6
+
+- Add build-time `myket`, `bazaar`, `direct`, and `allStores` packaging. Include Poolakey only in Bazaar/allStores and Myket code, resources and manifest components only in Myket/allStores.
+- Keep runtime API-key selection, purchase verification, pending operations and recovery unchanged; excluded stores fail with `UNSUPPORTED_MARKET`.
+- Publish Gradle Module Metadata with all release variants; document migration, CI settings and the channel-specific manifest workaround.
+
 ## 0.2.4
 
 - Compact only Myket purchase payloads while preserving customer/recovery bindings and the deployed server's `purchaseBinding` contract. Reject oversized contexts before opening billing or recording a new pending native attempt; continue recovering older signed payloads.

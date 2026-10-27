@@ -5,7 +5,7 @@
 Source: https://github.com/myketstore/myket-billing-client/tree/1.6
 Pinned revision: `c9de652206f0e1d23e3acba9adff57181d5c2eb4`.
 The adapted files reside in
-`sdk/src/main/java/com/inappify/sdk/internal/billing/myket/`.
+`sdk/src/myketBilling/java/com/inappify/sdk/internal/billing/myket/`.
 
 Original copyright and license notices are retained in the corresponding source
 files. The upstream helper, security, receipt, inventory and Base64 sources

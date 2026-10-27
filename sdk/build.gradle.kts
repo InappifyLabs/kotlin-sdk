@@ -28,6 +28,29 @@ android {
         buildConfigField("String", "SDK_VERSION", "\"$sdkVersion\"")
     }
 
+    flavorDimensions += "inappifyStore"
+    productFlavors {
+        for (store in listOf("allStores", "myket", "bazaar", "direct")) {
+            create(store) { dimension = "inappifyStore" }
+        }
+    }
+    sourceSets {
+        for (store in listOf("allStores", "myket")) {
+            getByName(store) {
+                java.srcDirs("src/myketBilling/java", "src/myketBilling/kotlin")
+                res.srcDir("src/myketBilling/res")
+                resources.srcDir("src/myketBilling/resources")
+                manifest.srcFile("src/myketBilling/AndroidManifest.xml")
+            }
+            getByName("test" + store.replaceFirstChar { it.uppercase() }) {
+                java.srcDir("src/testMyketBilling/java")
+            }
+        }
+        for (store in listOf("allStores", "bazaar")) {
+            getByName(store).java.srcDir("src/bazaarBilling/kotlin")
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
@@ -50,7 +73,9 @@ android {
     }
 
     publishing {
-        singleVariant("release") {
+        multipleVariants("release") {
+            includeBuildTypeValues("release")
+            includeFlavorDimensionAndValues("inappifyStore", "allStores", "myket", "bazaar", "direct")
             withSourcesJar()
         }
     }
@@ -68,7 +93,8 @@ dependencies {
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.gson)
     implementation(libs.okhttp)
-    implementation(libs.poolakey)
+    add("allStoresImplementation", libs.poolakey)
+    add("bazaarImplementation", libs.poolakey)
     // Lightweight verifier; no global JCA provider is installed or replaced.
     implementation(libs.bouncycastle)
     testImplementation(libs.junit)

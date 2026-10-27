@@ -22,10 +22,7 @@ internal class AndroidStoreBillingAdapterFactory(
                     ),
                 )
             } else {
-                BazaarStoreBillingAdapter(
-                    applicationContext = applicationContext,
-                    rsaPublicKey = marketKey,
-                )
+                CompiledStoreAdapters.bazaar(applicationContext, marketKey)
             }
         }
 
@@ -35,7 +32,7 @@ internal class AndroidStoreBillingAdapterFactory(
                 "Myket billing requires a public RSA key.",
             ))
         } else {
-            MyketStoreBillingAdapter(applicationContext, marketKey)
+            CompiledStoreAdapters.myket(applicationContext, marketKey)
         }
 
         InappifyMarket.NONE -> UnsupportedStoreBillingAdapter(

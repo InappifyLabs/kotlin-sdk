@@ -4,14 +4,17 @@ Native Android purchases, customer entitlements, offerings, targeting and durabl
 purchase recovery for Inappify. The SDK supports Cafe Bazaar, Myket and Direct
 checkout through a verified V2 session.
 
-**Release:** `0.2.4` · **Git tag:** `v0.2.4`
+**Release:** `0.2.6` · **Git tag:** `v0.2.6`
 
-Configure, snapshots and SDK targeting report exactly `0.2.4`, without the Git
+Configure, snapshots and SDK targeting report exactly `0.2.6`, without the Git
 tag’s `v` prefix. No local version normalization changes the server’s offering
 selection.
 
 The Kotlin package is `com.inappify.sdk`. This is an Android library; it does not
 provide iOS, Flutter, Google Play Billing or a JavaScript client.
+
+See [store-specific builds](docs/ANDROID_STORES.md) for **0.2.6**
+release, its required `missingDimensionStrategy`, and per-store dependencies.
 
 ## Install
 
@@ -49,11 +52,14 @@ In the app module:
 
 ```kotlin
 android {
-    defaultConfig { minSdk = 21 }
+    defaultConfig {
+        minSdk = 21
+        missingDimensionStrategy("inappifyStore", "allStores")
+    }
 }
 
 dependencies {
-    implementation("com.github.InappifyLabs:kotlin-sdk:v0.2.4")
+    implementation("com.github.InappifyLabs:kotlin-sdk:v0.2.6")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
 }
 ```
